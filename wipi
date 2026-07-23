@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly CONNECTION_NAME="wipi-ap"
+
+die() {
+  printf 'wipi: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || die "run this command with sudo"
+}
+
+connection_exists() {
+  nmcli --terse --fields NAME connection show | grep -Fxq "${CONNECTION_NAME}"
+}
+
+show_status() {
+  connection_exists || die "access point is not installed"
+
+  local state device ssid address
+  state=$(nmcli -g GENERAL.STATE connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+  device=$(nmcli -g GENERAL.DEVICES connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+  ssid=$(nmcli -g 802-11-wireless.ssid connection show "${CONNECTION_NAME}")
+  address=$(nmcli -g ipv4.addresses connection show "${CONNECTION_NAME}")
+
+  printf 'Access point: %s\n' "${state:-inactive}"
+  printf 'SSID:         %s\n' "${ssid}"
+  printf 'Interface:    %s\n' "${device:--}"
+  printf 'Pi address:   %s\n' "${address}"
+
+  if [[ -n ${device} && ${device} != "--" ]] && command -v iw >/dev/null 2>&1; then
+    printf '\nConnected clients:\n'
+    iw dev "${device}" station dump |
+      awk '/^Station / { mac=$2 } /signal:/ { printf "  %s  signal %s %s\n", mac, $2, $3 }'
+  fi
+}
+
+show_help() {
+  cat <<'EOF'
+Usage: sudo wipi COMMAND
+
+Commands:
+  status      Show access-point state and connected clients
+  start       Start the access point
+  stop        Stop the access point
+  restart     Restart the access point
+  uninstall   Remove the access-point configuration and this command
+EOF
+}
+
+main() {
+  case ${1:-status} in
+    status)
+      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
+      show_status
+      ;;
+    start)
+      require_root
+      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
+      connection_exists || die "access point is not installed"
+      nmcli connection up "${CONNECTION_NAME}"
+      ;;
+    stop)
+      require_root
+      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
+      connection_exists || die "access point is not installed"
+      nmcli connection down "${CONNECTION_NAME}"
+      ;;
+    restart)
+      require_root
+      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
+      connection_exists || die "access point is not installed"
+      nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
+      nmcli connection up "${CONNECTION_NAME}"
+      ;;
+    uninstall)
+      require_root
+      if command -v nmcli >/dev/null 2>&1 && connection_exists; then
+        nmcli connection delete "${CONNECTION_NAME}"
+      fi
+      rm -f /usr/local/sbin/wipi
+      printf 'wipi has been removed\n'
+      ;;
+    help|-h|--help)
+      show_help
+      ;;
+    *)
+      show_help >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
