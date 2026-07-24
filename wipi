@@ -37,12 +37,57 @@ show_status() {
   fi
 }
 
+show_diagnostics() {
+  connection_exists || die "access point is not installed"
+
+  local device wireless_fields
+  device=$(nmcli -g GENERAL.DEVICES connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+  wireless_fields="GENERAL.STATE,GENERAL.DEVICES,802-11-wireless.ssid,802-11-wireless.channel,802-11-wireless.powersave"
+  if nmcli --fields 802-11-wireless.channel-width connection show "${CONNECTION_NAME}" \
+    >/dev/null 2>&1; then
+    wireless_fields="${wireless_fields},802-11-wireless.channel-width"
+  fi
+
+  printf '== System ==\n'
+  sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null || true
+  uname -a
+  nmcli --version
+
+  printf '== NetworkManager ==\n'
+  nmcli --fields "${wireless_fields}" connection show "${CONNECTION_NAME}"
+
+  printf '\n== Devices ==\n'
+  nmcli device status
+
+  if [[ -n ${device} && ${device} != "--" ]] && command -v iw >/dev/null 2>&1; then
+    printf '\n== Wi-Fi link ==\n'
+    iw dev "${device}" info
+    iw dev "${device}" get power_save 2>/dev/null || true
+    iw dev "${device}" station dump
+  fi
+
+  if command -v rfkill >/dev/null 2>&1; then
+    printf '\n== Radio blocks ==\n'
+    rfkill list wifi
+  fi
+
+  if command -v vcgencmd >/dev/null 2>&1; then
+    printf '\n== Pi power/thermal flags ==\n'
+    vcgencmd get_throttled
+  fi
+
+  printf '\n== Recent Wi-Fi events ==\n'
+  journalctl --no-pager -n 80 -u NetworkManager 2>/dev/null |
+    grep -Ei 'wlan|wifi|wipi|brcm|deauth|disconnect|fail|error' || true
+}
+
 show_help() {
   cat <<'EOF'
 Usage: sudo wipi COMMAND
 
 Commands:
   status      Show access-point state and connected clients
+  diagnose    Show radio, power, and recent disconnect information
   start       Start the access point
   stop        Stop the access point
   restart     Restart the access point
@@ -55,6 +100,10 @@ main() {
     status)
       command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
       show_status
+      ;;
+    diagnose)
+      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
+      show_diagnostics
       ;;
     start)
       require_root

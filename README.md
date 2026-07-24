@@ -35,8 +35,8 @@ sudo \
   ./install.sh
 ```
 
-Re-running the installer safely replaces the `wipi-ap` profile with the new
-settings.
+Re-running the installer upgrades the installation while preserving the current
+SSID, password, address, and channel. Set an environment option to change it.
 
 ## Reach a service
 
@@ -59,6 +59,7 @@ enabled, allow the service port on the Wi-Fi interface.
 
 ```sh
 sudo wipi status
+sudo wipi diagnose
 sudo wipi restart
 sudo wipi stop
 sudo wipi start
@@ -73,6 +74,30 @@ sudo wipi uninstall
 
 Current Raspberry Pi OS releases include NetworkManager. The installer adds it
 with `apt` when necessary.
+
+## Troubleshooting unstable connections
+
+The access-point profile disables Wi-Fi power saving and keeps the radio's
+permanent MAC address. On Trixie and other systems with NetworkManager 1.50 or
+newer, it also fixes the 2.4 GHz channel width at 20 MHz. These settings favor a
+stable control connection.
+
+If an SSH session stalls, keep a second terminal running:
+
+```sh
+ping 10.42.0.1
+```
+
+If ping stalls at the same time, collect the Pi-side radio and power information
+over Ethernet:
+
+```sh
+sudo wipi diagnose
+```
+
+Check `vcgencmd get_throttled` in the output. A value other than `0x0` can
+indicate a present or previous undervoltage or thermal event. Also try channels
+1, 6, and 11; re-run the installer with, for example, `WIPI_CHANNEL=1`.
 
 ## Development
 

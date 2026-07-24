@@ -66,6 +66,24 @@ generate_password() {
   printf 'wipi-%s\n' "${generated:0:12}"
 }
 
+load_existing_settings() {
+  if ! nmcli --terse --fields NAME connection show |
+    grep -Fxq "${CONNECTION_NAME}"; then
+    return
+  fi
+
+  local saved_ssid saved_password saved_address saved_channel
+  saved_ssid=$(nmcli --escape no -g 802-11-wireless.ssid connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+  saved_password=$(nmcli --escape no --show-secrets -g 802-11-wireless-security.psk connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+  saved_address=$(nmcli --escape no -g ipv4.addresses connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+  saved_channel=$(nmcli --escape no -g 802-11-wireless.channel connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+
+  WIPI_SSID=${WIPI_SSID:-${saved_ssid}}
+  WIPI_PASSWORD=${WIPI_PASSWORD:-${saved_password}}
+  WIPI_ADDRESS=${WIPI_ADDRESS:-${saved_address}}
+  WIPI_CHANNEL=${WIPI_CHANNEL:-${saved_channel}}
+}
+
 validate_settings() {
   [[ ${#WIPI_SSID} -ge 1 && ${#WIPI_SSID} -le 32 ]] ||
     die "WIPI_SSID must contain 1 to 32 characters"
@@ -122,6 +140,7 @@ configure_access_point() {
     802-11-wireless.mode ap \
     802-11-wireless.band bg \
     802-11-wireless.channel "${WIPI_CHANNEL}" \
+    802-11-wireless.cloned-mac-address permanent \
     802-11-wireless.powersave 2 \
     wifi-sec.key-mgmt wpa-psk \
     wifi-sec.psk "${WIPI_PASSWORD}" \
@@ -129,8 +148,22 @@ configure_access_point() {
     ipv4.addresses "${WIPI_ADDRESS}" \
     ipv6.method disabled
 
+  # NetworkManager 1.50+ supports explicit AP channel width. Trixie has it;
+  # Bookworm does not, so detect the field instead of comparing versions.
+  if nmcli --fields 802-11-wireless.channel-width connection show "${CONNECTION_NAME}" \
+    >/dev/null 2>&1; then
+    nmcli connection modify "${CONNECTION_NAME}" \
+      802-11-wireless.channel-width 20
+  fi
+
   if ! nmcli connection up "${CONNECTION_NAME}"; then
     die "the access point profile was created, but could not be started; run 'sudo wipi status' for details"
+  fi
+
+  # Some brcmfmac/iw combinations report power saving independently of
+  # NetworkManager. Reinforce the profile setting after the interface is up.
+  if command -v iw >/dev/null 2>&1; then
+    iw dev "${interface}" set power_save off 2>/dev/null || true
   fi
 }
 
@@ -142,13 +175,15 @@ main() {
   require_root
   require_linux
 
+  install_network_manager
+  load_existing_settings
+
   WIPI_SSID=${WIPI_SSID:-wipi}
   WIPI_PASSWORD=${WIPI_PASSWORD:-$(generate_password)}
   WIPI_ADDRESS=${WIPI_ADDRESS:-${DEFAULT_ADDRESS}}
   WIPI_CHANNEL=${WIPI_CHANNEL:-6}
   validate_settings
 
-  install_network_manager
   configure_country
 
   local interface
