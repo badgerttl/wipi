@@ -64,6 +64,12 @@ show_diagnostics() {
     iw dev "${device}" info
     iw dev "${device}" get power_save 2>/dev/null || true
     iw dev "${device}" station dump
+
+    printf '\n== Regulatory domain ==\n'
+    iw reg get
+
+    printf '\n== Channel survey ==\n'
+    iw dev "${device}" survey dump 2>/dev/null || true
   fi
 
   if command -v rfkill >/dev/null 2>&1; then
@@ -79,6 +85,11 @@ show_diagnostics() {
   printf '\n== Recent Wi-Fi events ==\n'
   journalctl --no-pager -n 80 -u NetworkManager 2>/dev/null |
     grep -Ei 'wlan|wifi|wipi|brcm|deauth|disconnect|fail|error' || true
+
+  printf '\n== Recent kernel Wi-Fi events ==\n'
+  journalctl --no-pager -b -k 2>/dev/null |
+    grep -Ei 'brcm|wlan|cfg80211|firmware.*(crash|fail|error)|mmc.*error' |
+    tail -n 80 || true
 }
 
 show_help() {

@@ -99,6 +99,12 @@ Check `vcgencmd get_throttled` in the output. A value other than `0x0` can
 indicate a present or previous undervoltage or thermal event. Also try channels
 1, 6, and 11; re-run the installer with, for example, `WIPI_CHANNEL=1`.
 
+In the connected-station output, a transmit rate stuck at 1 Mbit/s together
+with a growing `tx failed` count points to an RF or Wi-Fi driver problem rather
+than an SSH service problem. The diagnostic report includes the channel survey
+and `brcmfmac` kernel events needed to distinguish interference from a driver or
+firmware failure.
+
 ## Development
 
 Run the local checks before committing:
