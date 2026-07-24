@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly CONNECTION_NAME="wipi-ap"
 readonly DEFAULT_ADDRESS="10.42.0.1/24"
+readonly BACKEND_CONFIG="/etc/NetworkManager/conf.d/99-wipi-backend.conf"
 
 log() {
   printf '[wipi] %s\n' "$*"
@@ -39,17 +40,6 @@ install_network_manager() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y network-manager
 }
 
-configured_wifi_backend() {
-  local backend_config=/etc/NetworkManager/conf.d/99-wipi-backend.conf
-
-  if [[ -r ${backend_config} ]] &&
-    grep -Eq '^[[:space:]]*wifi\.backend[[:space:]]*=[[:space:]]*iwd[[:space:]]*$' "${backend_config}"; then
-    printf 'iwd\n'
-  else
-    printf 'wpa_supplicant\n'
-  fi
-}
-
 install_apt_package() {
   local package=$1
 
@@ -62,38 +52,19 @@ install_apt_package() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${package}"
 }
 
-configure_wifi_backend() {
-  local config_dir=/etc/NetworkManager/conf.d
-  local config_file=${config_dir}/99-wipi-backend.conf
+restore_supported_wifi_backend() {
+  if [[ ! -r ${BACKEND_CONFIG} ]] ||
+    ! grep -Eq '^[[:space:]]*wifi\.backend[[:space:]]*=[[:space:]]*iwd[[:space:]]*$' "${BACKEND_CONFIG}"; then
+    return
+  fi
 
-  case ${WIPI_BACKEND} in
-    iwd)
-      install_apt_package network-manager-iwd
-      install -d -m755 "${config_dir}"
-      {
-        printf '[device-wipi-backend]\n'
-        printf 'wifi.backend=iwd\n'
-        printf 'wifi.iwd.autoconnect=false\n'
-      } >"${config_file}"
-      systemctl enable --now iwd
-      ;;
-    wpa_supplicant)
-      if ! command -v wpa_supplicant >/dev/null 2>&1; then
-        install_apt_package wpasupplicant
-      fi
-      systemctl disable --now iwd 2>/dev/null || true
-      install -d -m755 "${config_dir}"
-      {
-        printf '[device-wipi-backend]\n'
-        printf 'wifi.backend=wpa_supplicant\n'
-      } >"${config_file}"
-      ;;
-    *)
-      die "WIPI_BACKEND must be wpa_supplicant or iwd"
-      ;;
-  esac
-
-  log "using NetworkManager Wi-Fi backend '${WIPI_BACKEND}'"
+  log "restoring the supported wpa_supplicant Wi-Fi backend"
+  install_apt_package wpasupplicant
+  systemctl disable --now iwd 2>/dev/null || true
+  {
+    printf '[device-wipi-backend]\n'
+    printf 'wifi.backend=wpa_supplicant\n'
+  } >"${BACKEND_CONFIG}"
   systemctl restart NetworkManager
   nm-online --quiet --timeout 15 2>/dev/null || true
 }
@@ -212,7 +183,7 @@ configure_access_point() {
     if [[ ${five_ghz_support} == "no" ]]; then
       die "'${interface}' reports that it does not support 5 GHz"
     elif [[ ${five_ghz_support} != "yes" ]]; then
-      log "warning: ${WIPI_BACKEND} did not report 5 GHz capability; attempting activation"
+      log "warning: NetworkManager did not report 5 GHz capability; attempting activation"
     fi
   fi
 
@@ -229,6 +200,8 @@ configure_access_point() {
     con-name "${CONNECTION_NAME}" \
     ssid "${WIPI_SSID}" >/dev/null
 
+  # The Pi 4's BCM43455 can stall sustained AP downlink traffic when PMF is
+  # negotiated. Keep WPA2/CCMP, but explicitly disable PMF (NM enum value 1).
   nmcli connection modify "${CONNECTION_NAME}" \
     connection.autoconnect yes \
     connection.autoconnect-priority 100 \
@@ -256,16 +229,7 @@ configure_access_point() {
   fi
 
   if ! nmcli connection up "${CONNECTION_NAME}"; then
-    if [[ ${WIPI_BACKEND} == "iwd" ]]; then
-      log "iwd could not activate AP mode; restoring the wpa_supplicant backend"
-      WIPI_BACKEND=wpa_supplicant
-      configure_wifi_backend
-      if ! nmcli connection up "${CONNECTION_NAME}"; then
-        die "the access point profile was created, but could not be started; run 'sudo wipi diagnose' for details"
-      fi
-    else
-      die "the access point profile was created, but could not be started; run 'sudo wipi diagnose' for details"
-    fi
+    die "the access point profile was created, but could not be started; run 'sudo wipi diagnose' for details"
   fi
 
   # Some brcmfmac/iw combinations report power saving independently of
@@ -292,7 +256,6 @@ main() {
   WIPI_SSID=${WIPI_SSID:-wipi}
   WIPI_PASSWORD=${WIPI_PASSWORD:-$(generate_password)}
   WIPI_ADDRESS=${WIPI_ADDRESS:-${DEFAULT_ADDRESS}}
-  WIPI_BACKEND=${WIPI_BACKEND:-$(configured_wifi_backend)}
   WIPI_BAND=${WIPI_BAND:-2.4}
   normalize_band
 
@@ -309,7 +272,7 @@ main() {
   validate_settings
 
   configure_country
-  configure_wifi_backend
+  restore_supported_wifi_backend
 
   local interface
   interface=$(find_wifi_interface)
@@ -321,7 +284,6 @@ main() {
   log "access point is ready"
   printf '  SSID:       %s\n' "${WIPI_SSID}"
   printf '  Password:   %s\n' "${WIPI_PASSWORD}"
-  printf '  Backend:    %s\n' "${WIPI_BACKEND}"
   printf '  Radio:      %s GHz, channel %s\n' "${WIPI_BAND}" "${WIPI_CHANNEL}"
   printf '  Pi address: %s\n' "${host_address}"
   printf '  Status:     sudo wipi status\n'

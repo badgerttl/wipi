@@ -49,31 +49,6 @@ sudo WIPI_COUNTRY="US" WIPI_BAND="5" WIPI_CHANNEL="36" ./install.sh
 If `WIPI_CHANNEL` is omitted when switching bands, the installer chooses channel
 36 for 5 GHz and channel 6 for 2.4 GHz.
 
-### Wi-Fi backend
-
-NetworkManager uses `wpa_supplicant` by default. Debian Trixie also packages an
-experimental `iwd` backend. To test it while preserving the hotspot credentials
-and radio settings:
-
-```sh
-sudo WIPI_BACKEND="iwd" ./install.sh
-```
-
-To return to the default backend:
-
-```sh
-sudo WIPI_BACKEND="wpa_supplicant" ./install.sh
-```
-
-The selected backend is preserved on subsequent upgrades. Switching backends
-restarts NetworkManager and briefly disconnects the access point, so run the
-installer over Ethernet. If iwd cannot activate AP mode, the installer
-automatically restores wpa_supplicant and starts the hotspot with it.
-
-Some NetworkManager/iwd combinations do not expose the adapter's band capability
-before AP activation. In that case the installer warns and attempts activation;
-it only stops early when the adapter explicitly reports that 5 GHz is unsupported.
-
 ## Reach a service
 
 The service must listen on all interfaces, not only localhost. For example:
@@ -111,13 +86,34 @@ sudo wipi uninstall
 Current Raspberry Pi OS releases include NetworkManager. The installer adds it
 with `apt` when necessary.
 
-## Troubleshooting unstable connections
+## Raspberry Pi 4 compatibility
 
-The access-point profile disables Wi-Fi power saving and keeps the radio's
-permanent MAC address. On Trixie and other systems with NetworkManager 1.50 or
-newer, it also fixes the channel width at 20 MHz. These settings favor a stable
-control connection. The security profile uses WPA2/CCMP and disables Protected
-Management Frames for compatibility with the Pi 4's BCM43455 AP firmware.
+The BCM43455 Wi-Fi firmware used by Raspberry Pi 4 has limited Protected
+Management Frame support in access-point mode. When PMF is negotiated, clients
+can associate successfully but sustained Pi-to-client traffic can stall. This
+matches a [documented BCM43455 AP-mode
+limitation](https://github.com/raspberrypi/linux/issues/3619).
+
+To avoid that failure mode, wipi explicitly configures:
+
+- WPA2/RSN authentication with a pre-shared key
+- CCMP/AES encryption
+- Protected Management Frames disabled
+- Wi-Fi power saving disabled
+- A permanent access-point MAC address
+- A 20 MHz channel width when supported by NetworkManager
+
+Disabling PMF means the network does not cryptographically protect management
+frames such as deauthentication messages. WPA2 data encryption remains enabled.
+For this device-local access point, compatibility is favored over PMF support.
+NetworkManager documents `1` as the
+[`disable` PMF value](https://www.networkmanager.dev/docs/api/latest/nm-settings-nmcli.html).
+
+Earlier development versions offered an experimental iwd backend. The installer
+automatically migrates those installations back to NetworkManager's supported
+`wpa_supplicant` backend.
+
+## Troubleshooting
 
 If an SSH session stalls, keep a second terminal running:
 
@@ -146,9 +142,14 @@ than an SSH service problem. The diagnostic report includes the channel survey
 and `brcmfmac` kernel events needed to distinguish interference from a driver or
 firmware failure.
 
-If client-to-Pi transfers work but Pi-to-client transfers stall, capture
-diagnostics during the stall. A separate hostapd backend may be required if the
-Broadcom firmware still stalls after the WPA2/PMF compatibility settings.
+If client-to-Pi transfers work but Pi-to-client transfers stall, verify that the
+installed profile contains the compatibility setting:
+
+```sh
+nmcli -g 802-11-wireless-security.pmf connection show wipi-ap
+```
+
+The expected value is `1 (disable)`. Re-run `sudo ./install.sh` if it differs.
 
 ## Development
 

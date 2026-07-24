@@ -56,10 +56,9 @@ show_diagnostics() {
   uname -a
   nmcli --version
 
-  printf '\n== Wi-Fi backend ==\n'
+  printf '\n== NetworkManager Wi-Fi backend ==\n'
   NetworkManager --print-config 2>/dev/null |
-    grep -E '^\[device|^[[:space:]]*wifi\.(backend|iwd\.autoconnect)' || true
-  systemctl is-active iwd 2>/dev/null || true
+    grep -E '^\[device|^[[:space:]]*wifi\.backend' || true
 
   printf '== NetworkManager ==\n'
   nmcli --fields "${wireless_fields}" connection show "${CONNECTION_NAME}"
