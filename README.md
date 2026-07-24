@@ -69,6 +69,10 @@ The selected backend is preserved on subsequent upgrades. Switching backends
 restarts NetworkManager and briefly disconnects the access point, so run the
 installer over Ethernet.
 
+Some NetworkManager/iwd combinations do not expose the adapter's band capability
+before AP activation. In that case the installer warns and attempts activation;
+it only stops early when the adapter explicitly reports that 5 GHz is unsupported.
+
 ## Reach a service
 
 The service must listen on all interfaces, not only localhost. For example:

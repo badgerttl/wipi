@@ -199,15 +199,20 @@ configure_country() {
 
 configure_access_point() {
   local interface=$1
+  local five_ghz_support
 
   systemctl enable --now NetworkManager
   rfkill unblock wifi 2>/dev/null || true
   nmcli radio wifi on
   nmcli device set "${interface}" managed yes
 
-  if [[ ${WIPI_BAND} == "5" ]] &&
-    [[ $(nmcli -g WIFI-PROPERTIES.5GHZ device show "${interface}" 2>/dev/null || true) != "yes" ]]; then
-    die "'${interface}' does not report 5 GHz support"
+  if [[ ${WIPI_BAND} == "5" ]]; then
+    five_ghz_support=$(nmcli -g WIFI-PROPERTIES.5GHZ device show "${interface}" 2>/dev/null || true)
+    if [[ ${five_ghz_support} == "no" ]]; then
+      die "'${interface}' reports that it does not support 5 GHz"
+    elif [[ ${five_ghz_support} != "yes" ]]; then
+      log "warning: ${WIPI_BACKEND} did not report 5 GHz capability; attempting activation"
+    fi
   fi
 
   if nmcli --terse --fields NAME connection show |
