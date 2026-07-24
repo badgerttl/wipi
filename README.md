@@ -40,14 +40,34 @@ Re-running the installer upgrades the installation while preserving the current
 SSID, password, address, band, and channel. Set an environment option to change
 it.
 
-On a dual-band Pi such as the Raspberry Pi 4, use a non-DFS 5 GHz channel:
+## Choose a Wi-Fi band
+
+Both 2.4 and 5 GHz use the same WPA2/CCMP and Raspberry Pi 4 compatibility
+settings.
+
+Use 2.4 GHz for greater range, better wall penetration, and compatibility with
+older or IoT devices:
+
+```sh
+sudo WIPI_COUNTRY="US" WIPI_BAND="2.4" WIPI_CHANNEL="6" ./install.sh
+```
+
+Channels 1, 6, and 11 are the usual non-overlapping 2.4 GHz choices. The default
+is channel 6.
+
+Use 5 GHz for nearby modern devices, less congestion, and more responsive SSH
+or service access:
 
 ```sh
 sudo WIPI_COUNTRY="US" WIPI_BAND="5" WIPI_CHANNEL="36" ./install.sh
 ```
 
-If `WIPI_CHANNEL` is omitted when switching bands, the installer chooses channel
-36 for 5 GHz and channel 6 for 2.4 GHz.
+The installer supports non-DFS 5 GHz channels 36, 40, 44, and 48. Channel 36 is
+the default. Set `WIPI_COUNTRY` to the Pi's actual two-letter country code so
+NetworkManager applies the correct regulatory rules.
+
+If `WIPI_CHANNEL` is omitted when switching bands, the installer automatically
+chooses channel 6 for 2.4 GHz and channel 36 for 5 GHz.
 
 ## Reach a service
 
