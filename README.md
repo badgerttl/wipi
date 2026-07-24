@@ -106,6 +106,10 @@ over Ethernet:
 sudo wipi diagnose
 ```
 
+For intermittent SSH stalls, run the diagnostic command over Ethernet while the
+Wi-Fi session is actively frozen. The report includes the SSH socket's unacked
+data, retransmission state, Wi-Fi interface counters, and transmit queue.
+
 Check `vcgencmd get_throttled` in the output. A value other than `0x0` can
 indicate a present or previous undervoltage or thermal event. Also try channels
 1, 6, and 11; re-run the installer with, for example, `WIPI_CHANNEL=1`.

@@ -73,6 +73,19 @@ show_diagnostics() {
 
     printf '\n== Channel survey ==\n'
     iw dev "${device}" survey dump 2>/dev/null || true
+
+    printf '\n== Interface counters ==\n'
+    ip -s link show dev "${device}"
+
+    if command -v tc >/dev/null 2>&1; then
+      printf '\n== Transmit queue ==\n'
+      tc -s qdisc show dev "${device}" 2>/dev/null || true
+    fi
+
+    if command -v ethtool >/dev/null 2>&1; then
+      printf '\n== Interface offloads ==\n'
+      ethtool -k "${device}" 2>/dev/null || true
+    fi
   fi
 
   if command -v rfkill >/dev/null 2>&1; then
@@ -83,6 +96,18 @@ show_diagnostics() {
   if command -v vcgencmd >/dev/null 2>&1; then
     printf '\n== Pi power/thermal flags ==\n'
     vcgencmd get_throttled
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    printf '\n== Active SSH transport ==\n'
+    ss -tinp state established \
+      '( sport = :22 or dport = :22 )' 2>/dev/null || true
+  fi
+
+  if command -v nstat >/dev/null 2>&1; then
+    printf '\n== TCP retransmission counters ==\n'
+    nstat -az 2>/dev/null |
+      grep -E 'TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPTimeouts|TcpExtTCPSpuriousRTOs' || true
   fi
 
   printf '\n== Recent Wi-Fi events ==\n'
