@@ -30,13 +30,24 @@ sudo \
   WIPI_PASSWORD="choose-a-secure-password" \
   WIPI_COUNTRY="US" \
   WIPI_INTERFACE="wlan0" \
+  WIPI_BAND="2.4" \
   WIPI_CHANNEL="6" \
   WIPI_ADDRESS="10.42.0.1/24" \
   ./install.sh
 ```
 
 Re-running the installer upgrades the installation while preserving the current
-SSID, password, address, and channel. Set an environment option to change it.
+SSID, password, address, band, and channel. Set an environment option to change
+it.
+
+On a dual-band Pi such as the Raspberry Pi 4, use a non-DFS 5 GHz channel:
+
+```sh
+sudo WIPI_COUNTRY="US" WIPI_BAND="5" WIPI_CHANNEL="36" ./install.sh
+```
+
+If `WIPI_CHANNEL` is omitted when switching bands, the installer chooses channel
+36 for 5 GHz and channel 6 for 2.4 GHz.
 
 ## Reach a service
 
@@ -79,8 +90,8 @@ with `apt` when necessary.
 
 The access-point profile disables Wi-Fi power saving and keeps the radio's
 permanent MAC address. On Trixie and other systems with NetworkManager 1.50 or
-newer, it also fixes the 2.4 GHz channel width at 20 MHz. These settings favor a
-stable control connection.
+newer, it also fixes the channel width at 20 MHz. These settings favor a stable
+control connection.
 
 If an SSH session stalls, keep a second terminal running:
 

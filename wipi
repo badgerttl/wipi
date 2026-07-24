@@ -19,15 +19,18 @@ connection_exists() {
 show_status() {
   connection_exists || die "access point is not installed"
 
-  local state device ssid address
+  local state device ssid band channel address
   state=$(nmcli -g GENERAL.STATE connection show "${CONNECTION_NAME}" 2>/dev/null || true)
   device=$(nmcli -g GENERAL.DEVICES connection show "${CONNECTION_NAME}" 2>/dev/null || true)
   ssid=$(nmcli -g 802-11-wireless.ssid connection show "${CONNECTION_NAME}")
+  band=$(nmcli -g 802-11-wireless.band connection show "${CONNECTION_NAME}")
+  channel=$(nmcli -g 802-11-wireless.channel connection show "${CONNECTION_NAME}")
   address=$(nmcli -g ipv4.addresses connection show "${CONNECTION_NAME}")
 
   printf 'Access point: %s\n' "${state:-inactive}"
   printf 'SSID:         %s\n' "${ssid}"
   printf 'Interface:    %s\n' "${device:--}"
+  printf 'Radio:        %s, channel %s\n' "${band}" "${channel}"
   printf 'Pi address:   %s\n' "${address}"
 
   if [[ -n ${device} && ${device} != "--" ]] && command -v iw >/dev/null 2>&1; then
@@ -42,7 +45,7 @@ show_diagnostics() {
 
   local device wireless_fields
   device=$(nmcli -g GENERAL.DEVICES connection show "${CONNECTION_NAME}" 2>/dev/null || true)
-  wireless_fields="GENERAL.STATE,GENERAL.DEVICES,802-11-wireless.ssid,802-11-wireless.channel,802-11-wireless.powersave"
+  wireless_fields="GENERAL.STATE,GENERAL.DEVICES,802-11-wireless.ssid,802-11-wireless.band,802-11-wireless.channel,802-11-wireless.powersave"
   if nmcli --fields 802-11-wireless.channel-width connection show "${CONNECTION_NAME}" \
     >/dev/null 2>&1; then
     wireless_fields="${wireless_fields},802-11-wireless.channel-width"

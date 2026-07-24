@@ -72,16 +72,34 @@ load_existing_settings() {
     return
   fi
 
-  local saved_ssid saved_password saved_address saved_channel
+  local saved_ssid saved_password saved_address saved_channel saved_band
   saved_ssid=$(nmcli --escape no -g 802-11-wireless.ssid connection show "${CONNECTION_NAME}" 2>/dev/null || true)
   saved_password=$(nmcli --escape no --show-secrets -g 802-11-wireless-security.psk connection show "${CONNECTION_NAME}" 2>/dev/null || true)
   saved_address=$(nmcli --escape no -g ipv4.addresses connection show "${CONNECTION_NAME}" 2>/dev/null || true)
   saved_channel=$(nmcli --escape no -g 802-11-wireless.channel connection show "${CONNECTION_NAME}" 2>/dev/null || true)
+  saved_band=$(nmcli --escape no -g 802-11-wireless.band connection show "${CONNECTION_NAME}" 2>/dev/null || true)
 
   WIPI_SSID=${WIPI_SSID:-${saved_ssid}}
   WIPI_PASSWORD=${WIPI_PASSWORD:-${saved_password}}
   WIPI_ADDRESS=${WIPI_ADDRESS:-${saved_address}}
   WIPI_CHANNEL=${WIPI_CHANNEL:-${saved_channel}}
+  WIPI_BAND=${WIPI_BAND:-${saved_band}}
+}
+
+normalize_band() {
+  case ${WIPI_BAND,,} in
+    2.4|2.4ghz|bg)
+      WIPI_BAND="2.4"
+      NM_BAND="bg"
+      ;;
+    5|5ghz|a)
+      WIPI_BAND="5"
+      NM_BAND="a"
+      ;;
+    *)
+      die "WIPI_BAND must be 2.4 or 5"
+      ;;
+  esac
 }
 
 validate_settings() {
@@ -91,8 +109,16 @@ validate_settings() {
     die "WIPI_PASSWORD must contain 8 to 63 characters"
   [[ ${WIPI_CHANNEL} =~ ^[0-9]+$ ]] ||
     die "WIPI_CHANNEL must be a number"
-  ((WIPI_CHANNEL >= 1 && WIPI_CHANNEL <= 13)) ||
-    die "WIPI_CHANNEL must be between 1 and 13"
+
+  if [[ ${WIPI_BAND} == "2.4" ]]; then
+    ((WIPI_CHANNEL >= 1 && WIPI_CHANNEL <= 13)) ||
+      die "2.4 GHz WIPI_CHANNEL must be between 1 and 13"
+  else
+    case ${WIPI_CHANNEL} in
+      36|40|44|48) ;;
+      *) die "5 GHz WIPI_CHANNEL must be 36, 40, 44, or 48" ;;
+    esac
+  fi
 }
 
 configure_country() {
@@ -121,6 +147,11 @@ configure_access_point() {
   nmcli radio wifi on
   nmcli device set "${interface}" managed yes
 
+  if [[ ${WIPI_BAND} == "5" ]] &&
+    [[ $(nmcli -g WIFI-PROPERTIES.5GHZ device show "${interface}" 2>/dev/null || true) != "yes" ]]; then
+    die "'${interface}' does not report 5 GHz support"
+  fi
+
   if nmcli --terse --fields NAME connection show |
     grep -Fxq "${CONNECTION_NAME}"; then
     log "replacing the existing ${CONNECTION_NAME} profile"
@@ -138,7 +169,7 @@ configure_access_point() {
     connection.autoconnect yes \
     connection.autoconnect-priority 100 \
     802-11-wireless.mode ap \
-    802-11-wireless.band bg \
+    802-11-wireless.band "${NM_BAND}" \
     802-11-wireless.channel "${WIPI_CHANNEL}" \
     802-11-wireless.cloned-mac-address permanent \
     802-11-wireless.powersave 2 \
@@ -175,13 +206,28 @@ main() {
   require_root
   require_linux
 
+  local band_was_set=${WIPI_BAND+x}
+  local channel_was_set=${WIPI_CHANNEL+x}
+
   install_network_manager
   load_existing_settings
 
   WIPI_SSID=${WIPI_SSID:-wipi}
   WIPI_PASSWORD=${WIPI_PASSWORD:-$(generate_password)}
   WIPI_ADDRESS=${WIPI_ADDRESS:-${DEFAULT_ADDRESS}}
-  WIPI_CHANNEL=${WIPI_CHANNEL:-6}
+  WIPI_BAND=${WIPI_BAND:-2.4}
+  normalize_band
+
+  # When switching bands without an explicit channel, choose a safe,
+  # non-DFS default instead of reusing the other band's channel.
+  if [[ -n ${band_was_set} && -z ${channel_was_set} ]]; then
+    WIPI_CHANNEL=
+  fi
+  if [[ ${WIPI_BAND} == "5" ]]; then
+    WIPI_CHANNEL=${WIPI_CHANNEL:-36}
+  else
+    WIPI_CHANNEL=${WIPI_CHANNEL:-6}
+  fi
   validate_settings
 
   configure_country
@@ -196,6 +242,7 @@ main() {
   log "access point is ready"
   printf '  SSID:       %s\n' "${WIPI_SSID}"
   printf '  Password:   %s\n' "${WIPI_PASSWORD}"
+  printf '  Radio:      %s GHz, channel %s\n' "${WIPI_BAND}" "${WIPI_CHANNEL}"
   printf '  Pi address: %s\n' "${host_address}"
   printf '  Status:     sudo wipi status\n'
   printf '\nServices must listen on 0.0.0.0 (or %s) to accept Wi-Fi clients.\n' "${host_address}"
