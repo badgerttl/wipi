@@ -39,6 +39,64 @@ install_network_manager() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y network-manager
 }
 
+configured_wifi_backend() {
+  local backend_config=/etc/NetworkManager/conf.d/99-wipi-backend.conf
+
+  if [[ -r ${backend_config} ]] &&
+    grep -Eq '^[[:space:]]*wifi\.backend[[:space:]]*=[[:space:]]*iwd[[:space:]]*$' "${backend_config}"; then
+    printf 'iwd\n'
+  else
+    printf 'wpa_supplicant\n'
+  fi
+}
+
+install_apt_package() {
+  local package=$1
+
+  if dpkg-query -W -f='${Status}' "${package}" 2>/dev/null |
+    grep -Fq 'install ok installed'; then
+    return
+  fi
+
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${package}"
+}
+
+configure_wifi_backend() {
+  local config_dir=/etc/NetworkManager/conf.d
+  local config_file=${config_dir}/99-wipi-backend.conf
+
+  case ${WIPI_BACKEND} in
+    iwd)
+      install_apt_package network-manager-iwd
+      install -d -m755 "${config_dir}"
+      {
+        printf '[device-wipi-backend]\n'
+        printf 'wifi.backend=iwd\n'
+        printf 'wifi.iwd.autoconnect=false\n'
+      } >"${config_file}"
+      systemctl enable --now iwd
+      ;;
+    wpa_supplicant)
+      if ! command -v wpa_supplicant >/dev/null 2>&1; then
+        install_apt_package wpasupplicant
+      fi
+      systemctl disable --now iwd 2>/dev/null || true
+      install -d -m755 "${config_dir}"
+      {
+        printf '[device-wipi-backend]\n'
+        printf 'wifi.backend=wpa_supplicant\n'
+      } >"${config_file}"
+      ;;
+    *)
+      die "WIPI_BACKEND must be wpa_supplicant or iwd"
+      ;;
+  esac
+
+  log "using NetworkManager Wi-Fi backend '${WIPI_BACKEND}'"
+  systemctl restart NetworkManager
+}
+
 find_wifi_interface() {
   local requested=${WIPI_INTERFACE:-}
   local interface
@@ -215,6 +273,7 @@ main() {
   WIPI_SSID=${WIPI_SSID:-wipi}
   WIPI_PASSWORD=${WIPI_PASSWORD:-$(generate_password)}
   WIPI_ADDRESS=${WIPI_ADDRESS:-${DEFAULT_ADDRESS}}
+  WIPI_BACKEND=${WIPI_BACKEND:-$(configured_wifi_backend)}
   WIPI_BAND=${WIPI_BAND:-2.4}
   normalize_band
 
@@ -231,6 +290,7 @@ main() {
   validate_settings
 
   configure_country
+  configure_wifi_backend
 
   local interface
   interface=$(find_wifi_interface)
@@ -242,6 +302,7 @@ main() {
   log "access point is ready"
   printf '  SSID:       %s\n' "${WIPI_SSID}"
   printf '  Password:   %s\n' "${WIPI_PASSWORD}"
+  printf '  Backend:    %s\n' "${WIPI_BACKEND}"
   printf '  Radio:      %s GHz, channel %s\n' "${WIPI_BAND}" "${WIPI_CHANNEL}"
   printf '  Pi address: %s\n' "${host_address}"
   printf '  Status:     sudo wipi status\n'

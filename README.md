@@ -49,6 +49,26 @@ sudo WIPI_COUNTRY="US" WIPI_BAND="5" WIPI_CHANNEL="36" ./install.sh
 If `WIPI_CHANNEL` is omitted when switching bands, the installer chooses channel
 36 for 5 GHz and channel 6 for 2.4 GHz.
 
+### Wi-Fi backend
+
+NetworkManager uses `wpa_supplicant` by default. Debian Trixie also packages the
+`iwd` backend. To switch backends while preserving the hotspot credentials and
+radio settings:
+
+```sh
+sudo WIPI_BACKEND="iwd" ./install.sh
+```
+
+To return to the default backend:
+
+```sh
+sudo WIPI_BACKEND="wpa_supplicant" ./install.sh
+```
+
+The selected backend is preserved on subsequent upgrades. Switching backends
+restarts NetworkManager and briefly disconnects the access point, so run the
+installer over Ethernet.
+
 ## Reach a service
 
 The service must listen on all interfaces, not only localhost. For example:
@@ -119,6 +139,10 @@ with a growing `tx failed` count points to an RF or Wi-Fi driver problem rather
 than an SSH service problem. The diagnostic report includes the channel survey
 and `brcmfmac` kernel events needed to distinguish interference from a driver or
 firmware failure.
+
+If client-to-Pi transfers work but Pi-to-client transfers stall on both 2.4 and
+5 GHz, try the Trixie `iwd` backend. This changes the Wi-Fi control daemon while
+retaining NetworkManager's DHCP, addressing, and connection-sharing setup.
 
 ## Development
 
