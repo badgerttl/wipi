@@ -51,9 +51,9 @@ If `WIPI_CHANNEL` is omitted when switching bands, the installer chooses channel
 
 ### Wi-Fi backend
 
-NetworkManager uses `wpa_supplicant` by default. Debian Trixie also packages the
-`iwd` backend. To switch backends while preserving the hotspot credentials and
-radio settings:
+NetworkManager uses `wpa_supplicant` by default. Debian Trixie also packages an
+experimental `iwd` backend. To test it while preserving the hotspot credentials
+and radio settings:
 
 ```sh
 sudo WIPI_BACKEND="iwd" ./install.sh
@@ -67,7 +67,8 @@ sudo WIPI_BACKEND="wpa_supplicant" ./install.sh
 
 The selected backend is preserved on subsequent upgrades. Switching backends
 restarts NetworkManager and briefly disconnects the access point, so run the
-installer over Ethernet.
+installer over Ethernet. If iwd cannot activate AP mode, the installer
+automatically restores wpa_supplicant and starts the hotspot with it.
 
 Some NetworkManager/iwd combinations do not expose the adapter's band capability
 before AP activation. In that case the installer warns and attempts activation;
@@ -115,7 +116,8 @@ with `apt` when necessary.
 The access-point profile disables Wi-Fi power saving and keeps the radio's
 permanent MAC address. On Trixie and other systems with NetworkManager 1.50 or
 newer, it also fixes the channel width at 20 MHz. These settings favor a stable
-control connection.
+control connection. The security profile uses WPA2/CCMP and disables Protected
+Management Frames for compatibility with the Pi 4's BCM43455 AP firmware.
 
 If an SSH session stalls, keep a second terminal running:
 
@@ -144,9 +146,9 @@ than an SSH service problem. The diagnostic report includes the channel survey
 and `brcmfmac` kernel events needed to distinguish interference from a driver or
 firmware failure.
 
-If client-to-Pi transfers work but Pi-to-client transfers stall on both 2.4 and
-5 GHz, try the Trixie `iwd` backend. This changes the Wi-Fi control daemon while
-retaining NetworkManager's DHCP, addressing, and connection-sharing setup.
+If client-to-Pi transfers work but Pi-to-client transfers stall, capture
+diagnostics during the stall. A separate hostapd backend may be required if the
+Broadcom firmware still stalls after the WPA2/PMF compatibility settings.
 
 ## Development
 

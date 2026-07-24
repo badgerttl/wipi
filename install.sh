@@ -95,6 +95,7 @@ configure_wifi_backend() {
 
   log "using NetworkManager Wi-Fi backend '${WIPI_BACKEND}'"
   systemctl restart NetworkManager
+  nm-online --quiet --timeout 15 2>/dev/null || true
 }
 
 find_wifi_interface() {
@@ -237,6 +238,10 @@ configure_access_point() {
     802-11-wireless.cloned-mac-address permanent \
     802-11-wireless.powersave 2 \
     wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.proto rsn \
+    wifi-sec.pairwise ccmp \
+    wifi-sec.group ccmp \
+    wifi-sec.pmf 1 \
     wifi-sec.psk "${WIPI_PASSWORD}" \
     ipv4.method shared \
     ipv4.addresses "${WIPI_ADDRESS}" \
@@ -251,7 +256,16 @@ configure_access_point() {
   fi
 
   if ! nmcli connection up "${CONNECTION_NAME}"; then
-    die "the access point profile was created, but could not be started; run 'sudo wipi status' for details"
+    if [[ ${WIPI_BACKEND} == "iwd" ]]; then
+      log "iwd could not activate AP mode; restoring the wpa_supplicant backend"
+      WIPI_BACKEND=wpa_supplicant
+      configure_wifi_backend
+      if ! nmcli connection up "${CONNECTION_NAME}"; then
+        die "the access point profile was created, but could not be started; run 'sudo wipi diagnose' for details"
+      fi
+    else
+      die "the access point profile was created, but could not be started; run 'sudo wipi diagnose' for details"
+    fi
   fi
 
   # Some brcmfmac/iw combinations report power saving independently of
