@@ -1,183 +1,281 @@
-# wipi
+# WiPi
 
-Turn a Raspberry Pi into a private Wi-Fi access point with one command. Devices
-that join the network receive an IP address automatically and can reach services
-running on the Pi at `10.42.0.1`.
+WiPi turns a NetworkManager-based Raspberry Pi into a focused management access
+point. One command installs, configures, starts, stops, diagnoses, switches, and
+removes the AP:
+
+```sh
+sudo wipi <command>
+```
+
+WiPi has two explicit operating modes.
+
+## Routed mode
+
+Use routed mode when a phone or laptop connected to WiPi should access:
+
+- The Internet
+- A wired target network
+- Other upstream IP networks
+
+NetworkManager provides DHCP, forwarded DNS, IPv4 routing, and NAT through
+`ipv4.method shared`. If an upstream interface is pinned, WiPi adds a narrowly
+scoped filter that permits AP-client forwarding only through that interface.
+
+This is Layer 3 routing and NAT, not an Ethernet bridge. LLDP, CDP, ARP scanning,
+DHCP discovery, raw Ethernet, and VLAN-tagged traffic do not cross it.
+
+## Isolated mode
+
+Use isolated mode when the AP should provide access only to:
+
+- Local dashboards
+- Local APIs
+- Services running on the Pi
+
+Clients receive DHCP from WiPi's dedicated dnsmasq process and can resolve the
+configured local hostname. Normal DNS queries are not forwarded. A WiPi-owned
+nftables table blocks all forwarding into or out of the AP interface, so there
+is no upstream routing or NAT even if another application has enabled global IP
+forwarding.
+
+WiPi does not open or manage dashboard ports. Local services should bind to the
+AP address (or deliberately to all addresses); bind to the AP address when they
+must not be exposed through another Pi interface.
+
+## Assessment-appliance layout
+
+A typical dedicated appliance can keep each interface in one role:
+
+```text
+wlan0 = WiPi management AP
+wlan1 = Wi-Fi monitor adapter
+eth0  = wired inspection interface
+```
+
+WiPi defaults only to `wlan0` and never searches for or silently selects another
+wireless interface. Wi-Fi sniffing and monitoring tools can use `wlan1`, while
+LLDP/CDP and other Layer 2 tools can run directly on `eth0`. A laptop on the AP
+can perform upstream TCP or UDP probing only in routed mode. Layer 2 inspection
+must run directly on the Pi's target-facing interface.
 
 ## Install
 
-On a Raspberry Pi running Raspberry Pi OS Bookworm or newer:
+On Raspberry Pi OS Bookworm or newer:
 
 ```sh
-sudo ./install.sh
+sudo ./wipi install --mode isolated
 ```
 
-The installer generates a secure password and prints it when installation
-finishes. It configures NetworkManager's built-in DHCP, DNS, and connection
-sharing, then starts the access point immediately and after every reboot.
-
-To choose the network name and password:
+`install.sh` remains as a compatibility launcher:
 
 ```sh
-sudo WIPI_SSID="My Pi" WIPI_PASSWORD="choose-a-secure-password" ./install.sh
+sudo ./install.sh --mode isolated
 ```
 
-Useful optional settings:
+The installed command is `/usr/local/bin/wipi`. Installation creates one
+NetworkManager profile named `wipi`, one systemd service, and a persistent
+configuration at `/etc/wipi/wipi.conf`.
+
+WiPi generates a cryptographically random WPA2 password when no password is
+provided and prints it only at installation. Retrieve it later only with:
 
 ```sh
-sudo \
-  WIPI_SSID="My Pi" \
-  WIPI_PASSWORD="choose-a-secure-password" \
-  WIPI_COUNTRY="US" \
-  WIPI_INTERFACE="wlan0" \
-  WIPI_BAND="2.4" \
-  WIPI_CHANNEL="6" \
-  WIPI_ADDRESS="10.42.0.1/24" \
-  ./install.sh
+sudo wipi credentials
 ```
 
-Re-running the installer upgrades the installation while preserving the current
-SSID, password, address, band, and channel. Set an environment option to change
-it.
-
-## Choose a Wi-Fi band
-
-Both 2.4 and 5 GHz use the same WPA2/CCMP and Raspberry Pi 4 compatibility
-settings.
-
-Use 2.4 GHz for greater range, better wall penetration, and compatibility with
-older or IoT devices:
+Install routed mode with automatic route-table selection:
 
 ```sh
-sudo WIPI_COUNTRY="US" WIPI_BAND="2.4" WIPI_CHANNEL="6" ./install.sh
+sudo ./wipi install --mode routed
 ```
 
-Channels 1, 6, and 11 are the usual non-overlapping 2.4 GHz choices. The default
-is channel 6.
-
-Use 5 GHz for nearby modern devices, less congestion, and more responsive SSH
-or service access:
+Or pin AP-client forwarding to one existing interface:
 
 ```sh
-sudo WIPI_COUNTRY="US" WIPI_BAND="5" WIPI_CHANNEL="36" ./install.sh
+sudo ./wipi install --mode routed --upstream-interface eth0
 ```
 
-The installer supports non-DFS 5 GHz channels 36, 40, 44, and 48. Channel 36 is
-the default. Set `WIPI_COUNTRY` to the Pi's actual two-letter country code so
-NetworkManager applies the correct regulatory rules.
+WiPi installs only missing dependencies and runs `apt-get update` no more than
+once per installation run. It does not change NetworkManager's Wi-Fi backend or
+disable unrelated network services.
 
-If `WIPI_CHANNEL` is omitted when switching bands, the installer automatically
-chooses channel 6 for 2.4 GHz and channel 36 for 5 GHz.
+## Configure
 
-## Reach a service
-
-The service must listen on all interfaces, not only localhost. For example:
+Saved settings use a simple, validated format:
 
 ```sh
-python3 -m http.server 8000 --bind 0.0.0.0
+WIPI_INTERFACE="wlan0"
+WIPI_SSID="wipi"
+WIPI_PASSWORD="generated-password"
+WIPI_ADDRESS="10.42.0.1/24"
+WIPI_HOSTNAME="wipi.local"
+WIPI_COUNTRY="US"
+WIPI_BAND="2.4"
+WIPI_CHANNEL="6"
+WIPI_MODE="isolated"
+WIPI_UPSTREAM_INTERFACE=""
 ```
 
-After joining the `wipi` Wi-Fi network, open:
+The file is mode `0600`. WiPi parses only these keys and never sources or
+evaluates the file. Values are validated again before use.
 
-```text
-http://10.42.0.1:8000
+Configure with flags:
+
+```sh
+sudo wipi configure \
+  --interface wlan0 \
+  --ssid management-ap \
+  --mode isolated \
+  --address 10.10.0.1/24 \
+  --hostname wipi.local \
+  --country US \
+  --band 2.4 \
+  --channel 6
 ```
 
-The same pattern works for any TCP or UDP service. If a firewall such as UFW is
-enabled, allow the service port on the Wi-Fi interface.
+Or run `sudo wipi configure` in a terminal for a short interactive prompt.
+Passwords entered by that prompt are hidden. Environment variables with the
+same names as the saved keys can override settings during `install` and
+`configure`; successful changes are written back to the configuration file.
+
+WiPi currently restricts AP networks to `/24`. This keeps DHCP range
+calculation predictable and prevents unsafe small-subnet edge cases. The AP
+address itself may use any valid host address in that `/24`; the generated DHCP
+range avoids it.
+
+Switch modes persistently:
+
+```sh
+sudo wipi mode isolated
+sudo wipi mode routed
+```
+
+For routed mode, choose automatic routing or pin one interface:
+
+```sh
+sudo wipi configure --mode routed --upstream-interface eth0
+sudo wipi configure --mode routed --upstream-interface auto
+```
+
+Isolated mode always clears the upstream-interface setting.
+
+## Radio and security settings
+
+WiPi validates that the explicitly selected interface exists, is wireless,
+supports AP mode, and can initiate an AP on the requested channel. It defaults
+to 2.4 GHz channel 6. Supported 5 GHz channels are the non-DFS channels 36, 40,
+44, and 48.
+
+The NetworkManager profile uses:
+
+- WPA2-PSK with RSN and CCMP
+- A password of 8 to 63 bytes
+- A permanent AP MAC address
+- Wi-Fi power saving disabled in the profile and reinforced with `iw`
+- A 20 MHz channel width when the installed NetworkManager exposes that setting
+- The configured two-letter regulatory country
+
+The Raspberry Pi 4 BCM43455 has an AP-mode interoperability problem when
+Protected Management Frames are negotiated. WiPi explicitly sets NetworkManager
+PMF enum `1` (`disable`) for compatibility. WPA2 data encryption remains
+enabled, but management frames such as deauthentication frames are not
+cryptographically protected.
 
 ## Manage
 
 ```sh
+sudo wipi start
+sudo wipi stop
+sudo wipi restart
 sudo wipi status
 sudo wipi diagnose
-sudo wipi restart
-sudo wipi stop
-sudo wipi start
+sudo wipi credentials
 sudo wipi uninstall
 ```
 
-## Requirements
+`status` reports the mode, interface, SSID, channel, address, client count,
+DHCP/DNS behavior, forwarding, NAT, upstream, default route, and autostart state.
+It never prints the WPA password.
 
-- Raspberry Pi OS or Debian
-- A Wi-Fi adapter with access-point mode support
-- Internet access during installation only if NetworkManager is not installed
+`diagnose` is intentionally AP-focused. It shows:
 
-Current Raspberry Pi OS releases include NetworkManager. The installer adds it
-with `apt` when necessary.
+- Configuration with the password redacted
+- Interface, address, AP capabilities, power saving, and rfkill state
+- NetworkManager and `wipi` profile state
+- Associated clients
+- Routes and IPv4-forwarding state
+- WiPi-owned nftables rules
+- Recent NetworkManager messages related to Wi-Fi, `wipi`, or the AP interface
 
-## Raspberry Pi 4 compatibility
+## Firewall and forwarding ownership
 
-The BCM43455 Wi-Fi firmware used by Raspberry Pi 4 has limited Protected
-Management Frame support in access-point mode. When PMF is negotiated, clients
-can associate successfully but sustained Pi-to-client traffic can stall. This
-matches a [documented BCM43455 AP-mode
-limitation](https://github.com/raspberrypi/linux/issues/3619).
+WiPi never flushes the host firewall.
 
-To avoid that failure mode, wipi explicitly configures:
+In isolated mode it owns only `table inet wipi_filter`, whose forward hook drops
+packets entering from or leaving through the AP interface. Traffic terminating
+on the Pi is unaffected.
 
-- WPA2/RSN authentication with a pre-shared key
-- CCMP/AES encryption
-- Protected Management Frames disabled
-- Wi-Fi power saving disabled
-- A permanent access-point MAC address
-- A 20 MHz channel width when supported by NetworkManager
+In routed mode without a pinned upstream, NetworkManager owns the shared-mode
+forwarding and masquerade rules. With a pinned upstream, WiPi adds only its
+`wipi_filter` table to allow AP traffic through the selected interface, allow
+established replies, and drop unrelated or new inbound forwarding. NetworkManager
+still owns NAT.
 
-Disabling PMF means the network does not cryptographically protect management
-frames such as deauthentication messages. WPA2 data encryption remains enabled.
-For this device-local access point, compatibility is favored over PMF support.
-NetworkManager documents `1` as the
-[`disable` PMF value](https://www.networkmanager.dev/docs/api/latest/nm-settings-nmcli.html).
+WiPi records the prior `net.ipv4.ip_forward` value only when routed mode needs
+it. If WiPi changed that value, it restores the saved value when routed mode
+stops or switches to isolated mode. Isolation does not depend on the global
+value because the interface-specific firewall remains authoritative.
 
-Earlier development versions offered an experimental iwd backend. The installer
-automatically migrates those installations back to NetworkManager's supported
-`wpa_supplicant` backend.
+## Isolated DHCP and DNS
 
-## Troubleshooting
+Isolated mode uses a dedicated dnsmasq configuration and PID file under
+`/run/wipi`. It binds only to the AP interface and address, serves DHCP only for
+the AP `/24`, resolves only the configured local hostname, and uses `no-resolv`
+and `no-hosts` so normal client DNS is not forwarded.
 
-If an SSH session stalls, keep a second terminal running:
+WiPi does not change system-wide dnsmasq configuration and never kills
+system-wide `dnsmasq`, `hostapd`, `wpa_supplicant`, or unrelated processes.
 
-```sh
-ping 10.42.0.1
-```
-
-If ping stalls at the same time, collect the Pi-side radio and power information
-over Ethernet:
+## Uninstall
 
 ```sh
-sudo wipi diagnose
+sudo wipi uninstall
 ```
 
-For intermittent SSH stalls, run the diagnostic command over Ethernet while the
-Wi-Fi session is actively frozen. The report includes the SSH socket's unacked
-data, retransmission state, Wi-Fi interface counters, and transmit queue.
+Uninstall removes only WiPi-owned resources: its command, systemd unit,
+NetworkManager profiles, configuration, runtime/state directories, dnsmasq
+process/configuration, and nftables tables. It does not uninstall dependencies,
+change NetworkManager's backend, delete unrelated profiles, or flush unrelated
+firewall rules.
 
-Check `vcgencmd get_throttled` in the output. A value other than `0x0` can
-indicate a present or previous undervoltage or thermal event. Also try channels
-1, 6, and 11; re-run the installer with, for example, `WIPI_CHANNEL=1`.
-
-In the connected-station output, a transmit rate stuck at 1 Mbit/s together
-with a growing `tx failed` count points to an RF or Wi-Fi driver problem rather
-than an SSH service problem. The diagnostic report includes the channel survey
-and `brcmfmac` kernel events needed to distinguish interference from a driver or
-firmware failure.
-
-If client-to-Pi transfers work but Pi-to-client transfers stall, verify that the
-installed profile contains the compatibility setting:
+Keep the saved configuration with:
 
 ```sh
-nmcli -g 802-11-wireless-security.pmf connection show wipi-ap
+sudo wipi uninstall --keep-config
 ```
 
-The expected value is `1 (disable)`. Re-run `sudo ./install.sh` if it differs.
+## Development and test plan
 
-## Development
-
-Run the local checks before committing:
+Run:
 
 ```sh
 ./tests/check.sh
 ```
 
-The check validates both scripts with Bash and also runs ShellCheck when it is
-installed.
+The automated checks cover syntax, configuration validation, routed and
+isolated rendering, profile idempotency, repeated lifecycle operations, mode
+switching, security settings, password redaction, firewall ownership, and
+protection against automatic `wlan1` selection. Hardware and privileged tools
+are mocked.
+
+Before deploying to an assessment Pi, also perform a hardware integration pass:
+
+1. Associate two clients and verify DHCP, local hostname resolution, and local
+   services in isolated mode.
+2. Confirm Internet/target TCP and UDP access in routed mode.
+3. Confirm isolated clients cannot reach any upstream address even when another
+   application enables global forwarding.
+4. Pin `eth0` and confirm no AP-client traffic exits `wlan1` or another
+   interface.
+5. Reboot after each mode and confirm the persisted mode and autostart state.

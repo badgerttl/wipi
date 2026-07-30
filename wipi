@@ -1,188 +1,1299 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly CONNECTION_NAME="wipi-ap"
+readonly WIPI_VERSION="2.0.0"
+readonly CONNECTION_NAME="wipi"
+readonly LEGACY_CONNECTION_NAME="wipi-ap"
+readonly SERVICE_NAME="wipi.service"
+readonly TEST_ROOT="${WIPI_TEST_ROOT:-}"
+
+root_path() {
+  printf '%s%s\n' "${TEST_ROOT}" "$1"
+}
+
+CONFIG_DIR=$(root_path /etc/wipi)
+readonly CONFIG_DIR
+readonly CONFIG_FILE="${CONFIG_DIR}/wipi.conf"
+RUN_DIR=$(root_path /run/wipi)
+readonly RUN_DIR
+STATE_DIR=$(root_path /var/lib/wipi)
+readonly STATE_DIR
+UNIT_FILE=$(root_path /etc/systemd/system/wipi.service)
+readonly UNIT_FILE
+INSTALLED_COMMAND=$(root_path /usr/local/bin/wipi)
+readonly INSTALLED_COMMAND
+readonly SYSTEMD_COMMAND="/usr/local/bin/wipi"
+
+readonly -a CONFIG_KEYS=(
+  WIPI_INTERFACE
+  WIPI_SSID
+  WIPI_PASSWORD
+  WIPI_ADDRESS
+  WIPI_HOSTNAME
+  WIPI_COUNTRY
+  WIPI_BAND
+  WIPI_CHANNEL
+  WIPI_MODE
+  WIPI_UPSTREAM_INTERFACE
+)
+
+declare -a ENV_OVERRIDE_KEYS=()
+declare -a ENV_OVERRIDE_VALUES=()
+APT_UPDATED=0
+OPTION_COUNT=0
+BAND_WAS_OVERRIDDEN=0
+CHANNEL_WAS_OVERRIDDEN=0
+
+log() {
+  printf '[wipi] %s\n' "$*"
+}
+
+warn() {
+  printf '[wipi] warning: %s\n' "$*" >&2
+}
 
 die() {
-  printf 'wipi: %s\n' "$*" >&2
+  printf '[wipi] error: %s\n' "$*" >&2
   exit 1
 }
 
 require_root() {
+  if [[ ${WIPI_TEST_MODE:-0} == "1" ]]; then
+    return
+  fi
   [[ ${EUID} -eq 0 ]] || die "run this command with sudo"
 }
 
-connection_exists() {
-  nmcli --terse --fields NAME connection show | grep -Fxq "${CONNECTION_NAME}"
+require_no_arguments() {
+  local command=$1
+  shift
+  (($# == 0)) || die "'${command}' does not accept arguments"
 }
 
-show_status() {
-  connection_exists || die "access point is not installed"
-
-  local state device ssid band channel address
-  state=$(nmcli -g GENERAL.STATE connection show "${CONNECTION_NAME}" 2>/dev/null || true)
-  device=$(nmcli -g GENERAL.DEVICES connection show "${CONNECTION_NAME}" 2>/dev/null || true)
-  ssid=$(nmcli -g 802-11-wireless.ssid connection show "${CONNECTION_NAME}")
-  band=$(nmcli -g 802-11-wireless.band connection show "${CONNECTION_NAME}")
-  channel=$(nmcli -g 802-11-wireless.channel connection show "${CONNECTION_NAME}")
-  address=$(nmcli -g ipv4.addresses connection show "${CONNECTION_NAME}")
-
-  printf 'Access point: %s\n' "${state:-inactive}"
-  printf 'SSID:         %s\n' "${ssid}"
-  printf 'Interface:    %s\n' "${device:--}"
-  printf 'Radio:        %s, channel %s\n' "${band}" "${channel}"
-  printf 'Pi address:   %s\n' "${address}"
-
-  if [[ -n ${device} && ${device} != "--" ]] && command -v iw >/dev/null 2>&1; then
-    printf '\nConnected clients:\n'
-    iw dev "${device}" station dump |
-      awk '/^Station / { mac=$2 } /signal:/ { printf "  %s  signal %s %s\n", mac, $2, $3 }'
+require_linux() {
+  if [[ ${WIPI_TEST_MODE:-0} == "1" ]]; then
+    return
   fi
+  [[ $(uname -s) == "Linux" ]] || die "this command only supports Linux"
+  [[ -r /etc/os-release ]] || die "cannot identify this Linux distribution"
+
+  local os_id
+  os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
+  [[ ${os_id} == "raspbian" || ${os_id} == "debian" ]] ||
+    die "supported systems are Raspberry Pi OS and Debian"
 }
 
-show_diagnostics() {
-  connection_exists || die "access point is not installed"
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
 
-  local device wireless_fields
-  device=$(nmcli -g GENERAL.DEVICES connection show "${CONNECTION_NAME}" 2>/dev/null || true)
-  wireless_fields="GENERAL.STATE,GENERAL.DEVICES,802-11-wireless.ssid,802-11-wireless.band,802-11-wireless.channel,802-11-wireless.powersave"
-  if nmcli --fields 802-11-wireless.channel-width connection show "${CONNECTION_NAME}" \
-    >/dev/null 2>&1; then
-    wireless_fields="${wireless_fields},802-11-wireless.channel-width"
-  fi
+capture_environment_overrides() {
+  local key
+  for key in "${CONFIG_KEYS[@]}"; do
+    if declare -p "${key}" >/dev/null 2>&1; then
+      ENV_OVERRIDE_KEYS+=("${key}")
+      ENV_OVERRIDE_VALUES+=("${!key}")
+    fi
+  done
+}
 
-  printf '== System ==\n'
-  sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null || true
-  uname -a
-  nmcli --version
+set_defaults() {
+  WIPI_INTERFACE="wlan0"
+  WIPI_SSID="wipi"
+  WIPI_PASSWORD=""
+  WIPI_ADDRESS="10.42.0.1/24"
+  WIPI_HOSTNAME="wipi.local"
+  WIPI_COUNTRY="US"
+  WIPI_BAND="2.4"
+  WIPI_CHANNEL="6"
+  WIPI_MODE="isolated"
+  WIPI_UPSTREAM_INTERFACE=""
+}
 
-  printf '\n== NetworkManager Wi-Fi backend ==\n'
-  NetworkManager --print-config 2>/dev/null |
-    grep -E '^\[device|^[[:space:]]*wifi\.backend' || true
+is_config_key() {
+  local candidate=$1
+  local key
+  for key in "${CONFIG_KEYS[@]}"; do
+    [[ ${candidate} == "${key}" ]] && return 0
+  done
+  return 1
+}
 
-  printf '== NetworkManager ==\n'
-  nmcli --fields "${wireless_fields}" connection show "${CONNECTION_NAME}"
+decode_config_value() {
+  local encoded=$1
+  local decoded="" char next
+  local index=0
 
-  printf '\n== Devices ==\n'
-  nmcli device status
-
-  if [[ -n ${device} && ${device} != "--" ]] && command -v iw >/dev/null 2>&1; then
-    printf '\n== Wi-Fi link ==\n'
-    iw dev "${device}" info
-    iw dev "${device}" get power_save 2>/dev/null || true
-    iw dev "${device}" station dump
-
-    printf '\n== Regulatory domain ==\n'
-    iw reg get
-
-    printf '\n== Channel survey ==\n'
-    iw dev "${device}" survey dump 2>/dev/null || true
-
-    printf '\n== Interface counters ==\n'
-    ip -s link show dev "${device}"
-
-    if command -v tc >/dev/null 2>&1; then
-      printf '\n== Transmit queue ==\n'
-      tc -s qdisc show dev "${device}" 2>/dev/null || true
+  while ((index < ${#encoded})); do
+    char=${encoded:index:1}
+    if [[ ${char} != "\\" ]]; then
+      decoded+="${char}"
+      ((index += 1))
+      continue
     fi
 
-    if command -v ethtool >/dev/null 2>&1; then
-      printf '\n== Interface offloads ==\n'
-      ethtool -k "${device}" 2>/dev/null || true
+    ((index += 1))
+    ((index < ${#encoded})) ||
+      die "invalid trailing escape in ${CONFIG_FILE}"
+    next=${encoded:index:1}
+    case ${next} in
+      \\|'"'|'$'|'`') decoded+="${next}" ;;
+      *) die "unsupported escape in ${CONFIG_FILE}" ;;
+    esac
+    ((index += 1))
+  done
+
+  printf '%s\n' "${decoded}"
+}
+
+encode_config_value() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//\$/\\\$}
+  value=${value//\`/\\\`}
+  printf '%s\n' "${value}"
+}
+
+load_config() {
+  [[ -r ${CONFIG_FILE} ]] || return 0
+
+  local line key encoded value line_number=0
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    ((line_number += 1))
+    [[ -z ${line} || ${line} =~ ^[[:space:]]*# ]] && continue
+    if [[ ! ${line} =~ ^([A-Z_]+)=\"(.*)\"$ ]]; then
+      die "invalid configuration syntax at ${CONFIG_FILE}:${line_number}"
     fi
-  fi
-
-  if command -v rfkill >/dev/null 2>&1; then
-    printf '\n== Radio blocks ==\n'
-    rfkill list wifi
-  fi
-
-  if command -v vcgencmd >/dev/null 2>&1; then
-    printf '\n== Pi power/thermal flags ==\n'
-    vcgencmd get_throttled
-  fi
-
-  if command -v ss >/dev/null 2>&1; then
-    printf '\n== Active SSH transport ==\n'
-    ss -tinp state established \
-      '( sport = :22 or dport = :22 )' 2>/dev/null || true
-  fi
-
-  if command -v nstat >/dev/null 2>&1; then
-    printf '\n== TCP retransmission counters ==\n'
-    nstat -az 2>/dev/null |
-      grep -E 'TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPTimeouts|TcpExtTCPSpuriousRTOs' || true
-  fi
-
-  printf '\n== Recent Wi-Fi events ==\n'
-  journalctl --no-pager -n 80 -u NetworkManager 2>/dev/null |
-    grep -Ei 'wlan|wifi|wipi|brcm|deauth|disconnect|fail|error' || true
-
-  printf '\n== Recent kernel Wi-Fi events ==\n'
-  journalctl --no-pager -b -k 2>/dev/null |
-    grep -Ei 'brcm|wlan|cfg80211|firmware.*(crash|fail|error)|mmc.*error' |
-    tail -n 80 || true
+    key=${BASH_REMATCH[1]}
+    encoded=${BASH_REMATCH[2]}
+    is_config_key "${key}" ||
+      die "unexpected configuration key '${key}' at ${CONFIG_FILE}:${line_number}"
+    value=$(decode_config_value "${encoded}")
+    printf -v "${key}" '%s' "${value}"
+  done <"${CONFIG_FILE}"
 }
 
-show_help() {
-  cat <<'EOF'
-Usage: sudo wipi COMMAND
-
-Commands:
-  status      Show access-point state and connected clients
-  diagnose    Show radio, power, and recent disconnect information
-  start       Start the access point
-  stop        Stop the access point
-  restart     Restart the access point
-  uninstall   Remove the access-point configuration and this command
-EOF
+apply_environment_overrides() {
+  local index
+  for ((index = 0; index < ${#ENV_OVERRIDE_KEYS[@]}; index += 1)); do
+    printf -v "${ENV_OVERRIDE_KEYS[index]}" '%s' \
+      "${ENV_OVERRIDE_VALUES[index]}"
+    case ${ENV_OVERRIDE_KEYS[index]} in
+      WIPI_BAND) BAND_WAS_OVERRIDDEN=1 ;;
+      WIPI_CHANNEL) CHANNEL_WAS_OVERRIDDEN=1 ;;
+    esac
+  done
 }
 
-main() {
-  case ${1:-status} in
-    status)
-      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
-      show_status
+write_config() {
+  install -d -m 700 "${CONFIG_DIR}"
+
+  local temporary key encoded
+  temporary=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")
+  chmod 600 "${temporary}"
+  for key in "${CONFIG_KEYS[@]}"; do
+    encoded=$(encode_config_value "${!key}")
+    printf '%s="%s"\n' "${key}" "${encoded}" >>"${temporary}"
+  done
+  mv -f "${temporary}" "${CONFIG_FILE}"
+  chmod 600 "${CONFIG_FILE}"
+}
+
+generate_password() {
+  local generated
+  generated=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  printf '%s\n' "${generated}"
+}
+
+normalize_band() {
+  local normalized
+  normalized=$(printf '%s' "${WIPI_BAND}" | tr '[:upper:]' '[:lower:]')
+  case ${normalized} in
+    2.4|2.4ghz|bg)
+      WIPI_BAND="2.4"
+      NM_BAND="bg"
       ;;
-    diagnose)
-      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
-      show_diagnostics
-      ;;
-    start)
-      require_root
-      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
-      connection_exists || die "access point is not installed"
-      nmcli connection up "${CONNECTION_NAME}"
-      ;;
-    stop)
-      require_root
-      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
-      connection_exists || die "access point is not installed"
-      nmcli connection down "${CONNECTION_NAME}"
-      ;;
-    restart)
-      require_root
-      command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
-      connection_exists || die "access point is not installed"
-      nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
-      nmcli connection up "${CONNECTION_NAME}"
-      ;;
-    uninstall)
-      require_root
-      if command -v nmcli >/dev/null 2>&1 && connection_exists; then
-        nmcli connection delete "${CONNECTION_NAME}"
-      fi
-      rm -f /usr/local/sbin/wipi
-      printf 'wipi has been removed\n'
-      ;;
-    help|-h|--help)
-      show_help
+    5|5ghz|a)
+      WIPI_BAND="5"
+      NM_BAND="a"
       ;;
     *)
-      show_help >&2
-      exit 2
+      die "band must be 2.4 or 5"
       ;;
   esac
 }
 
-main "$@"
+contains_control_character() {
+  local LC_ALL=C
+  [[ $1 =~ [[:cntrl:]] ]]
+}
+
+validate_interface_name() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$ ]] ||
+    die "invalid interface name '$1'"
+}
+
+validate_ssid() {
+  local LC_ALL=C
+  local value=$1
+  ((${#value} >= 1 && ${#value} <= 32)) ||
+    die "SSID must contain 1 to 32 bytes"
+  ! contains_control_character "${value}" ||
+    die "SSID must not contain control characters"
+}
+
+validate_password() {
+  local LC_ALL=C
+  local value=$1
+  ((${#value} >= 8 && ${#value} <= 63)) ||
+    die "password must contain 8 to 63 bytes"
+  ! contains_control_character "${value}" ||
+    die "password must not contain control characters"
+}
+
+validate_country() {
+  WIPI_COUNTRY=$(printf '%s' "${WIPI_COUNTRY}" |
+    tr '[:lower:]' '[:upper:]')
+  [[ ${WIPI_COUNTRY} =~ ^[A-Z]{2}$ ]] ||
+    die "country must be a two-letter code"
+}
+
+validate_ipv4_octet() {
+  [[ $1 =~ ^[0-9]{1,3}$ ]] || return 1
+  ((10#$1 >= 0 && 10#$1 <= 255))
+}
+
+validate_address() {
+  local address prefix octet
+  local -a octets
+
+  [[ ${WIPI_ADDRESS} =~ ^([^/]+)/([0-9]+)$ ]] ||
+    die "address must be an IPv4 CIDR"
+  address=${BASH_REMATCH[1]}
+  prefix=${BASH_REMATCH[2]}
+  [[ ${prefix} == "24" ]] ||
+    die "WiPi currently supports /24 AP networks only"
+
+  IFS=. read -r -a octets <<<"${address}"
+  ((${#octets[@]} == 4)) || die "address must be an IPv4 CIDR"
+  for octet in "${octets[@]}"; do
+    validate_ipv4_octet "${octet}" || die "address must be an IPv4 CIDR"
+  done
+  ((10#${octets[3]} >= 1 && 10#${octets[3]} <= 254)) ||
+    die "AP address cannot be the network or broadcast address"
+}
+
+validate_hostname() {
+  local hostname=${WIPI_HOSTNAME%.}
+  local label
+  local -a labels
+
+  ((${#hostname} >= 1 && ${#hostname} <= 253)) ||
+    die "hostname must contain 1 to 253 characters"
+  [[ ${hostname} =~ ^[A-Za-z0-9.-]+$ ]] ||
+    die "hostname contains invalid characters"
+  IFS=. read -r -a labels <<<"${hostname}"
+  for label in "${labels[@]}"; do
+    ((${#label} >= 1 && ${#label} <= 63)) ||
+      die "hostname labels must contain 1 to 63 characters"
+    [[ ${label} =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||
+      die "hostname labels cannot start or end with a hyphen"
+  done
+  WIPI_HOSTNAME=$(printf '%s' "${hostname}" |
+    tr '[:upper:]' '[:lower:]')
+}
+
+validate_mode_and_channel() {
+  case ${WIPI_MODE} in
+    routed|isolated) ;;
+    *) die "mode must be routed or isolated" ;;
+  esac
+
+  [[ ${WIPI_CHANNEL} =~ ^[0-9]+$ ]] ||
+    die "channel must be a number"
+  if [[ ${WIPI_BAND} == "2.4" ]]; then
+    ((WIPI_CHANNEL >= 1 && WIPI_CHANNEL <= 13)) ||
+      die "2.4 GHz channel must be between 1 and 13"
+  else
+    case ${WIPI_CHANNEL} in
+      36|40|44|48) ;;
+      *) die "5 GHz channel must be 36, 40, 44, or 48" ;;
+    esac
+  fi
+}
+
+validate_logical_settings() {
+  validate_interface_name "${WIPI_INTERFACE}"
+  validate_ssid "${WIPI_SSID}"
+  validate_password "${WIPI_PASSWORD}"
+  validate_address
+  validate_hostname
+  validate_country
+  normalize_band
+  validate_mode_and_channel
+
+  if [[ -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    validate_interface_name "${WIPI_UPSTREAM_INTERFACE}"
+    [[ ${WIPI_UPSTREAM_INTERFACE} != "${WIPI_INTERFACE}" ]] ||
+      die "upstream interface cannot be the AP interface"
+  fi
+  if [[ ${WIPI_MODE} == "isolated" ]]; then
+    WIPI_UPSTREAM_INTERFACE=""
+  fi
+}
+
+validate_hardware() {
+  if [[ ${WIPI_SKIP_HARDWARE_VALIDATION:-0} == "1" ]]; then
+    return
+  fi
+
+  ip link show dev "${WIPI_INTERFACE}" >/dev/null 2>&1 ||
+    die "interface '${WIPI_INTERFACE}' does not exist"
+  iw dev "${WIPI_INTERFACE}" info >/dev/null 2>&1 ||
+    die "'${WIPI_INTERFACE}' is not a wireless interface"
+
+  local phy_index phy_info channel_line
+  phy_index=$(iw dev "${WIPI_INTERFACE}" info |
+    awk '$1 == "wiphy" { print $2; exit }')
+  [[ ${phy_index} =~ ^[0-9]+$ ]] ||
+    die "could not determine wireless capabilities for '${WIPI_INTERFACE}'"
+  phy_info=$(iw phy "phy${phy_index}" info)
+  grep -Eq '^[[:space:]]*\*[[:space:]]+AP([[:space:]]|$)' <<<"${phy_info}" ||
+    die "'${WIPI_INTERFACE}' does not support AP mode"
+
+  channel_line=$(awk -v channel="[${WIPI_CHANNEL}]" \
+    'index($0, channel) { print; exit }' <<<"${phy_info}")
+  [[ -n ${channel_line} ]] ||
+    die "'${WIPI_INTERFACE}' does not support channel ${WIPI_CHANNEL}"
+  if grep -Eiq '\((disabled|no IR|radar detection)\)' <<<"${channel_line}"; then
+    die "channel ${WIPI_CHANNEL} cannot be used for an AP on '${WIPI_INTERFACE}'"
+  fi
+
+  if [[ -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    ip link show dev "${WIPI_UPSTREAM_INTERFACE}" >/dev/null 2>&1 ||
+      die "upstream interface '${WIPI_UPSTREAM_INTERFACE}' does not exist"
+  fi
+}
+
+validate_settings() {
+  validate_logical_settings
+  configure_country
+  validate_hardware
+}
+
+next_option_value() {
+  local option=$1
+  local value=${2:-}
+  [[ -n ${value} ]] || die "${option} requires a value"
+  printf '%s\n' "${value}"
+}
+
+parse_configuration_options() {
+  OPTION_COUNT=0
+  while (($#)); do
+    case $1 in
+      --interface)
+        WIPI_INTERFACE=$(next_option_value "$1" "${2:-}")
+        shift 2
+        ;;
+      --ssid)
+        WIPI_SSID=$(next_option_value "$1" "${2:-}")
+        shift 2
+        ;;
+      --password)
+        WIPI_PASSWORD=$(next_option_value "$1" "${2:-}")
+        shift 2
+        ;;
+      --address)
+        WIPI_ADDRESS=$(next_option_value "$1" "${2:-}")
+        shift 2
+        ;;
+      --hostname)
+        WIPI_HOSTNAME=$(next_option_value "$1" "${2:-}")
+        shift 2
+        ;;
+      --country)
+        WIPI_COUNTRY=$(next_option_value "$1" "${2:-}")
+        shift 2
+        ;;
+      --band)
+        WIPI_BAND=$(next_option_value "$1" "${2:-}")
+        BAND_WAS_OVERRIDDEN=1
+        shift 2
+        ;;
+      --channel)
+        WIPI_CHANNEL=$(next_option_value "$1" "${2:-}")
+        CHANNEL_WAS_OVERRIDDEN=1
+        shift 2
+        ;;
+      --mode)
+        WIPI_MODE=$(next_option_value "$1" "${2:-}")
+        shift 2
+        ;;
+      --upstream-interface)
+        (($# >= 2)) || die "$1 requires a value"
+        if [[ $2 == "auto" || $2 == "none" ]]; then
+          WIPI_UPSTREAM_INTERFACE=""
+        else
+          WIPI_UPSTREAM_INTERFACE=$2
+        fi
+        shift 2
+        ;;
+      -h|--help)
+        show_configuration_help
+        exit 0
+        ;;
+      *)
+        die "unknown configuration option '$1'"
+        ;;
+    esac
+    ((OPTION_COUNT += 1))
+  done
+}
+
+prompt_value() {
+  local prompt=$1 default=$2
+  local response
+  read -r -p "${prompt} [${default}]: " response
+  printf '%s\n' "${response:-${default}}"
+}
+
+interactive_configuration() {
+  [[ -t 0 ]] || return 0
+
+  WIPI_MODE=$(prompt_value "Mode (isolated or routed)" "${WIPI_MODE}")
+  WIPI_INTERFACE=$(prompt_value "AP interface" "${WIPI_INTERFACE}")
+  WIPI_SSID=$(prompt_value "SSID" "${WIPI_SSID}")
+  WIPI_ADDRESS=$(prompt_value "AP address (/24)" "${WIPI_ADDRESS}")
+  WIPI_HOSTNAME=$(prompt_value "Local hostname" "${WIPI_HOSTNAME}")
+  WIPI_COUNTRY=$(prompt_value "Country code" "${WIPI_COUNTRY}")
+  WIPI_BAND=$(prompt_value "Band (2.4 or 5)" "${WIPI_BAND}")
+  WIPI_CHANNEL=$(prompt_value "Channel" "${WIPI_CHANNEL}")
+  if [[ ${WIPI_MODE} == "routed" ]]; then
+    WIPI_UPSTREAM_INTERFACE=$(
+      prompt_value "Pinned upstream interface (blank for default route)" \
+        "${WIPI_UPSTREAM_INTERFACE}"
+    )
+  else
+    WIPI_UPSTREAM_INTERFACE=""
+  fi
+
+  local password_response
+  read -r -s -p "New WPA2 password (blank to keep current): " password_response
+  printf '\n'
+  [[ -z ${password_response} ]] || WIPI_PASSWORD=${password_response}
+}
+
+prepare_configuration() {
+  local allow_generate=$1
+  shift
+
+  capture_environment_overrides
+  BAND_WAS_OVERRIDDEN=0
+  CHANNEL_WAS_OVERRIDDEN=0
+  set_defaults
+  load_config
+  apply_environment_overrides
+  parse_configuration_options "$@"
+  if ((BAND_WAS_OVERRIDDEN == 1 && CHANNEL_WAS_OVERRIDDEN == 0)); then
+    case $(printf '%s' "${WIPI_BAND}" | tr '[:upper:]' '[:lower:]') in
+      5|5ghz|a) WIPI_CHANNEL="36" ;;
+      2.4|2.4ghz|bg) WIPI_CHANNEL="6" ;;
+    esac
+  fi
+  if [[ ${allow_generate} == "yes" && -z ${WIPI_PASSWORD} ]]; then
+    WIPI_PASSWORD=$(generate_password)
+  fi
+}
+
+connection_exists_named() {
+  nmcli --terse --fields NAME connection show 2>/dev/null |
+    grep -Fxq "$1"
+}
+
+connection_exists() {
+  connection_exists_named "${CONNECTION_NAME}"
+}
+
+profile_value() {
+  nmcli --escape no -g "$1" connection show "${CONNECTION_NAME}" 2>/dev/null ||
+    true
+}
+
+install_apt_packages() {
+  local -a packages=("$@")
+  ((${#packages[@]})) || return 0
+  command_exists apt-get ||
+    die "missing required tools and apt-get is unavailable"
+
+  if ((APT_UPDATED == 0)); then
+    log "updating package lists"
+    apt-get update
+    APT_UPDATED=1
+  fi
+  log "installing missing dependencies: ${packages[*]}"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+}
+
+install_dependencies() {
+  local -a packages=()
+  command_exists nmcli || packages+=(network-manager)
+  command_exists iw || packages+=(iw)
+  command_exists rfkill || packages+=(rfkill)
+  command_exists ip || packages+=(iproute2)
+  # dnsmasq-base supplies the binary without enabling a system-wide daemon.
+  command_exists dnsmasq || packages+=(dnsmasq-base)
+  command_exists nft || packages+=(nftables)
+  if ((${#packages[@]} > 0)); then
+    install_apt_packages "${packages[@]}"
+  fi
+
+  command_exists systemctl || die "systemd is required"
+  command_exists sysctl || die "sysctl is required"
+}
+
+configure_country() {
+  if command_exists iw; then
+    iw reg set "${WIPI_COUNTRY}" ||
+      warn "could not apply regulatory country ${WIPI_COUNTRY}"
+  fi
+}
+
+configure_profile() {
+  local created=0
+  local profile_type=""
+  if connection_exists; then
+    profile_type=$(profile_value connection.type)
+    if [[ ${profile_type} != "802-11-wireless" &&
+      ${profile_type} != "wifi" ]]; then
+      warn "recreating incompatible '${CONNECTION_NAME}' profile"
+      nmcli connection delete "${CONNECTION_NAME}" >/dev/null
+    fi
+  fi
+
+  if ! connection_exists; then
+    log "creating NetworkManager profile '${CONNECTION_NAME}'"
+    nmcli connection add \
+      type wifi \
+      ifname "${WIPI_INTERFACE}" \
+      con-name "${CONNECTION_NAME}" \
+      ssid "${WIPI_SSID}" >/dev/null
+    created=1
+  else
+    log "updating NetworkManager profile '${CONNECTION_NAME}' in place"
+  fi
+
+  if ! nmcli connection modify "${CONNECTION_NAME}" \
+    connection.id "${CONNECTION_NAME}" \
+    connection.interface-name "${WIPI_INTERFACE}" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 100 \
+    802-11-wireless.mode ap \
+    802-11-wireless.ssid "${WIPI_SSID}" \
+    802-11-wireless.band "${NM_BAND}" \
+    802-11-wireless.channel "${WIPI_CHANNEL}" \
+    802-11-wireless.cloned-mac-address permanent \
+    802-11-wireless.powersave 2 \
+    wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.proto rsn \
+    wifi-sec.pairwise ccmp \
+    wifi-sec.group ccmp \
+    wifi-sec.pmf 1 \
+    wifi-sec.psk "${WIPI_PASSWORD}" \
+    ipv6.method disabled; then
+    if ((created)); then
+      nmcli connection delete "${CONNECTION_NAME}" >/dev/null 2>&1 || true
+    fi
+    die "could not configure the NetworkManager profile"
+  fi
+
+  if [[ ${WIPI_MODE} == "routed" ]]; then
+    nmcli connection modify "${CONNECTION_NAME}" \
+      ipv4.method shared \
+      ipv4.addresses "${WIPI_ADDRESS}" \
+      ipv4.gateway "" \
+      ipv4.never-default no \
+      ipv4.ignore-auto-dns no
+  else
+    nmcli connection modify "${CONNECTION_NAME}" \
+      ipv4.method manual \
+      ipv4.addresses "${WIPI_ADDRESS}" \
+      ipv4.gateway "" \
+      ipv4.never-default yes \
+      ipv4.ignore-auto-dns yes
+  fi
+
+  if nmcli --fields 802-11-wireless.channel-width \
+    connection show "${CONNECTION_NAME}" >/dev/null 2>&1; then
+    nmcli connection modify "${CONNECTION_NAME}" \
+      802-11-wireless.channel-width 20
+  fi
+}
+
+write_systemd_unit() {
+  install -d -m 755 "$(dirname "${UNIT_FILE}")"
+  local temporary
+  temporary=$(mktemp "${UNIT_FILE}.tmp.XXXXXX")
+  cat >"${temporary}" <<EOF
+[Unit]
+Description=WiPi managed Raspberry Pi access point
+Requires=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${SYSTEMD_COMMAND} _service-start
+ExecStop=${SYSTEMD_COMMAND} _service-stop
+TimeoutStartSec=45
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "${temporary}"
+  mv -f "${temporary}" "${UNIT_FILE}"
+}
+
+install_command() {
+  if [[ ${BASH_SOURCE[0]} == "${INSTALLED_COMMAND}" ]]; then
+    return
+  fi
+  install -d -m 755 "$(dirname "${INSTALLED_COMMAND}")"
+  install -m 755 "${BASH_SOURCE[0]}" "${INSTALLED_COMMAND}"
+}
+
+dhcp_values() {
+  local address=${WIPI_ADDRESS%/*}
+  local first second third host
+  IFS=. read -r first second third host <<<"${address}"
+  AP_IPV4=${address}
+  AP_NETMASK="255.255.255.0"
+  if ((10#${host} >= 10 && 10#${host} <= 100)); then
+    DHCP_START="${first}.${second}.${third}.101"
+    DHCP_END="${first}.${second}.${third}.200"
+  else
+    DHCP_START="${first}.${second}.${third}.10"
+    DHCP_END="${first}.${second}.${third}.100"
+  fi
+}
+
+render_dnsmasq_config() {
+  dhcp_values
+  cat <<EOF
+interface=${WIPI_INTERFACE}
+bind-interfaces
+listen-address=${AP_IPV4}
+except-interface=lo
+dhcp-authoritative
+dhcp-range=${DHCP_START},${DHCP_END},${AP_NETMASK},12h
+dhcp-option=3,${AP_IPV4}
+dhcp-option=6,${AP_IPV4}
+address=/${WIPI_HOSTNAME}/${AP_IPV4}
+no-resolv
+no-hosts
+domain-needed
+bogus-priv
+EOF
+}
+
+write_dnsmasq_config() {
+  install -d -m 700 "${RUN_DIR}"
+  local temporary
+  temporary=$(mktemp "${RUN_DIR}/dnsmasq.conf.tmp.XXXXXX")
+  chmod 600 "${temporary}"
+  render_dnsmasq_config >"${temporary}"
+  mv -f "${temporary}" "${RUN_DIR}/dnsmasq.conf"
+}
+
+dnsmasq_is_running() {
+  local pid_file="${RUN_DIR}/dnsmasq.pid"
+  [[ -r ${pid_file} ]] || return 1
+  local pid
+  pid=$(<"${pid_file}")
+  [[ ${pid} =~ ^[0-9]+$ && -r "/proc/${pid}/cmdline" ]] || return 1
+  tr '\0' ' ' <"/proc/${pid}/cmdline" |
+    grep -Fq "${RUN_DIR}/dnsmasq.conf"
+}
+
+stop_dnsmasq() {
+  local pid_file="${RUN_DIR}/dnsmasq.pid"
+  if dnsmasq_is_running; then
+    local pid
+    pid=$(<"${pid_file}")
+    kill "${pid}" 2>/dev/null || true
+    local remaining=20
+    while ((remaining > 0)); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.1
+      remaining=$((remaining - 1))
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
+  fi
+  rm -f "${pid_file}" "${RUN_DIR}/dnsmasq.conf"
+}
+
+start_dnsmasq() {
+  stop_dnsmasq
+  write_dnsmasq_config
+  if ! dnsmasq \
+    --conf-file="${RUN_DIR}/dnsmasq.conf" \
+    --pid-file="${RUN_DIR}/dnsmasq.pid"; then
+    warn "dnsmasq failed to start"
+    return 1
+  fi
+  if ! dnsmasq_is_running; then
+    warn "isolated DHCP/DNS service did not stay running"
+    return 1
+  fi
+}
+
+render_firewall() {
+  if [[ ${WIPI_MODE} == "isolated" ]]; then
+    cat <<EOF
+table inet wipi_filter {
+  chain forward {
+    type filter hook forward priority -5; policy accept;
+    iifname "${WIPI_INTERFACE}" drop comment "WiPi blocks AP client forwarding"
+    oifname "${WIPI_INTERFACE}" drop comment "WiPi blocks forwarding to AP clients"
+  }
+}
+EOF
+  elif [[ -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    cat <<EOF
+table inet wipi_filter {
+  chain forward {
+    type filter hook forward priority -5; policy accept;
+    iifname "${WIPI_INTERFACE}" oifname "${WIPI_UPSTREAM_INTERFACE}" accept comment "WiPi pinned upstream"
+    iifname "${WIPI_INTERFACE}" drop comment "WiPi blocks unrelated upstreams"
+    iifname "${WIPI_UPSTREAM_INTERFACE}" oifname "${WIPI_INTERFACE}" ct state established,related accept comment "WiPi allows replies"
+    oifname "${WIPI_INTERFACE}" drop comment "WiPi blocks new inbound sessions"
+  }
+}
+EOF
+  fi
+}
+
+remove_firewall() {
+  command_exists nft || return 0
+  nft delete table inet wipi_filter >/dev/null 2>&1 || true
+  nft delete table ip wipi_nat >/dev/null 2>&1 || true
+}
+
+apply_firewall() {
+  remove_firewall
+  if [[ ${WIPI_MODE} == "isolated" ||
+    (${WIPI_MODE} == "routed" && -n ${WIPI_UPSTREAM_INTERFACE}) ]]; then
+    if ! render_firewall | nft -f -; then
+      warn "could not install the WiPi firewall policy"
+      return 1
+    fi
+  fi
+}
+
+read_ip_forwarding() {
+  sysctl -n net.ipv4.ip_forward
+}
+
+enable_ip_forwarding() {
+  install -d -m 700 "${STATE_DIR}"
+  local previous
+  previous=$(read_ip_forwarding)
+  if [[ ! -e ${STATE_DIR}/ip_forward.previous ]]; then
+    printf '%s\n' "${previous}" >"${STATE_DIR}/ip_forward.previous"
+    chmod 600 "${STATE_DIR}/ip_forward.previous"
+  fi
+  if [[ ${previous} != "1" ]]; then
+    sysctl -q -w net.ipv4.ip_forward=1
+    : >"${STATE_DIR}/ip_forward.changed"
+  fi
+}
+
+restore_ip_forwarding() {
+  local previous_file="${STATE_DIR}/ip_forward.previous"
+  local changed_file="${STATE_DIR}/ip_forward.changed"
+  if [[ -r ${previous_file} && -e ${changed_file} ]]; then
+    local previous current
+    previous=$(<"${previous_file}")
+    current=$(read_ip_forwarding)
+    if [[ ${previous} =~ ^[01]$ && ${current} == "1" ]]; then
+      sysctl -q -w "net.ipv4.ip_forward=${previous}"
+    fi
+  fi
+  rm -f "${previous_file}" "${changed_file}"
+}
+
+profile_is_active() {
+  nmcli --terse --fields NAME connection show --active 2>/dev/null |
+    grep -Fxq "${CONNECTION_NAME}"
+}
+
+activate_profile() {
+  rfkill unblock wifi 2>/dev/null || true
+  nmcli radio wifi on || return 1
+  nmcli device set "${WIPI_INTERFACE}" managed yes || return 1
+  nmcli connection up "${CONNECTION_NAME}" || return 1
+  iw dev "${WIPI_INTERFACE}" set power_save off 2>/dev/null || true
+}
+
+rollback_runtime() {
+  stop_dnsmasq
+  nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
+  remove_firewall
+  restore_ip_forwarding
+}
+
+startup_error() {
+  local status=$?
+  trap - ERR
+  rollback_runtime || true
+  warn "startup failed; WiPi-owned runtime resources were rolled back"
+  return "${status}"
+}
+
+service_start() {
+  require_root
+  command_exists nmcli || die "NetworkManager is not installed"
+  connection_exists || die "NetworkManager profile '${CONNECTION_NAME}' is missing"
+  set_defaults
+  load_config
+  validate_logical_settings
+  configure_country
+
+  trap startup_error ERR
+  install -d -m 700 "${RUN_DIR}" "${STATE_DIR}"
+  stop_dnsmasq
+  nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
+  remove_firewall
+
+  if [[ ${WIPI_MODE} == "routed" ]]; then
+    enable_ip_forwarding
+  else
+    restore_ip_forwarding
+  fi
+
+  if ! apply_firewall || ! activate_profile; then
+    rollback_runtime
+    die "access-point startup failed and WiPi-owned resources were rolled back"
+  fi
+
+  if [[ ${WIPI_MODE} == "isolated" ]]; then
+    if ! start_dnsmasq; then
+      rollback_runtime
+      die "isolated DHCP/DNS startup failed and WiPi-owned resources were rolled back"
+    fi
+  fi
+  trap - ERR
+}
+
+service_stop() {
+  require_root
+  stop_dnsmasq
+  if command_exists nmcli && connection_exists; then
+    nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
+  fi
+  remove_firewall
+  restore_ip_forwarding
+}
+
+systemd_available() {
+  command_exists systemctl && [[ -d $(root_path /run/systemd/system) ]]
+}
+
+start_access_point() {
+  if systemd_available; then
+    systemctl start "${SERVICE_NAME}"
+  else
+    service_start
+  fi
+}
+
+stop_access_point() {
+  if systemd_available; then
+    systemctl stop "${SERVICE_NAME}"
+  else
+    service_stop
+  fi
+}
+
+restart_access_point() {
+  if systemd_available; then
+    systemctl restart "${SERVICE_NAME}"
+  else
+    service_stop
+    service_start
+  fi
+}
+
+remove_legacy_profile() {
+  if connection_exists_named "${LEGACY_CONNECTION_NAME}"; then
+    log "removing the obsolete WiPi profile '${LEGACY_CONNECTION_NAME}'"
+    nmcli connection delete "${LEGACY_CONNECTION_NAME}" >/dev/null
+  fi
+}
+
+install_wipi() {
+  require_root
+  require_linux
+  install_dependencies
+  systemctl enable --now NetworkManager >/dev/null
+  prepare_configuration yes "$@"
+  validate_settings
+
+  configure_profile
+  write_config
+  install_command
+  write_systemd_unit
+  remove_legacy_profile
+
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}" >/dev/null
+  systemctl restart "${SERVICE_NAME}"
+
+  log "access point installed in ${WIPI_MODE} mode"
+  printf 'SSID:       %s\n' "${WIPI_SSID}"
+  printf 'Password:   %s\n' "${WIPI_PASSWORD}"
+  printf 'Interface:  %s\n' "${WIPI_INTERFACE}"
+  printf 'Address:    %s\n' "${WIPI_ADDRESS}"
+  printf 'Status:     sudo wipi status\n'
+}
+
+configure_wipi() {
+  require_root
+  [[ -r ${CONFIG_FILE} ]] ||
+    die "WiPi is not installed; run 'sudo wipi install' first"
+  prepare_configuration no "$@"
+  if ((OPTION_COUNT == 0 && ${#ENV_OVERRIDE_KEYS[@]} == 0)); then
+    interactive_configuration
+  fi
+  validate_settings
+  configure_profile
+  write_config
+  if systemctl is-enabled "${SERVICE_NAME}" >/dev/null 2>&1; then
+    systemctl restart "${SERVICE_NAME}"
+  else
+    start_access_point
+  fi
+  log "configuration updated"
+}
+
+set_mode() {
+  local mode=${1:-}
+  (($# == 1)) &&
+    [[ ${mode} == "routed" || ${mode} == "isolated" ]] ||
+    die "usage: sudo wipi mode routed|isolated"
+  configure_wipi --mode "${mode}"
+}
+
+client_count() {
+  if ! command_exists iw; then
+    printf 'unknown\n'
+    return
+  fi
+  { iw dev "${WIPI_INTERFACE}" station dump 2>/dev/null || true; } |
+    awk '/^Station / { count += 1 } END { print count + 0 }'
+}
+
+default_route_summary() {
+  local route
+  route=$(ip -4 route show default 2>/dev/null | head -n 1)
+  [[ -n ${route} ]] || {
+    printf 'none\n'
+    return
+  }
+  local gateway device
+  gateway=$(awk '{for (i=1; i<=NF; i++) if ($i=="via") print $(i+1)}' <<<"${route}")
+  device=$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}' <<<"${route}")
+  if [[ -n ${gateway} ]]; then
+    printf '%s via %s\n' "${gateway}" "${device:-unknown}"
+  else
+    printf 'direct via %s\n' "${device:-unknown}"
+  fi
+}
+
+status_value() {
+  printf '%-21s %s\n' "$1:" "$2"
+}
+
+show_status() {
+  require_root
+  command_exists nmcli || die "NetworkManager is not installed"
+  [[ -r ${CONFIG_FILE} ]] || die "WiPi is not installed"
+  set_defaults
+  load_config
+  validate_logical_settings
+
+  local active_state="inactive"
+  profile_is_active && active_state="active"
+  local autostart="disabled"
+  systemctl is-enabled "${SERVICE_NAME}" >/dev/null 2>&1 &&
+    autostart="enabled"
+
+  local dhcp dns forwarding nat upstream
+  if [[ ${WIPI_MODE} == "isolated" ]]; then
+    dns="local-only"
+    forwarding="blocked"
+    nat="disabled"
+    upstream="none"
+    if dnsmasq_is_running; then
+      dhcp="active"
+    else
+      dhcp="inactive"
+    fi
+  else
+    dns="forwarded"
+    forwarding="enabled"
+    nat="enabled (NetworkManager)"
+    dhcp=${active_state}
+    upstream=${WIPI_UPSTREAM_INTERFACE:-automatic}
+  fi
+
+  printf 'WiPi status\n'
+  status_value "Mode" "${WIPI_MODE}"
+  status_value "AP interface" "${WIPI_INTERFACE}"
+  status_value "AP state" "${active_state}"
+  status_value "SSID" "${WIPI_SSID}"
+  status_value "Band/channel" "${WIPI_BAND} GHz / ${WIPI_CHANNEL}"
+  status_value "AP address" "${WIPI_ADDRESS}"
+  status_value "Local hostname" "${WIPI_HOSTNAME}"
+  status_value "Connected clients" "$(client_count)"
+  status_value "DHCP" "${dhcp}"
+  status_value "DNS mode" "${dns}"
+  status_value "Forwarding" "${forwarding}"
+  status_value "NAT" "${nat}"
+  status_value "Upstream interface" "${upstream}"
+  if [[ ${WIPI_MODE} == "routed" ]]; then
+    status_value "Default route" "$(default_route_summary)"
+  fi
+  status_value "Autostart" "${autostart}"
+}
+
+redacted_config() {
+  local key
+  for key in "${CONFIG_KEYS[@]}"; do
+    if [[ ${key} == "WIPI_PASSWORD" ]]; then
+      printf '%s="<redacted>"\n' "${key}"
+    else
+      printf '%s="%s"\n' "${key}" "${!key}"
+    fi
+  done
+}
+
+show_diagnostics() {
+  require_root
+  command_exists nmcli || die "NetworkManager is not installed"
+  [[ -r ${CONFIG_FILE} ]] || die "WiPi is not installed"
+  set_defaults
+  load_config
+  validate_logical_settings
+
+  printf '== WiPi configuration ==\n'
+  redacted_config
+  printf '\n== Interface ==\n'
+  ip -brief link show dev "${WIPI_INTERFACE}" 2>&1 || true
+  ip -4 address show dev "${WIPI_INTERFACE}" 2>&1 || true
+
+  printf '\n== Wireless capabilities ==\n'
+  iw dev "${WIPI_INTERFACE}" info 2>&1 || true
+  local phy_index
+  phy_index=$(iw dev "${WIPI_INTERFACE}" info 2>/dev/null |
+    awk '$1 == "wiphy" { print $2; exit }')
+  if [[ ${phy_index} =~ ^[0-9]+$ ]]; then
+    iw phy "phy${phy_index}" info 2>/dev/null |
+      awk '
+        /Supported interface modes:/ {show=1}
+        show && /^[[:space:]]*\*[[:space:]]/ {print}
+        /Frequencies:/ {freq=1}
+        freq && /MHz/ {print}
+        freq && NF == 0 {exit}
+      ' || true
+  fi
+  iw dev "${WIPI_INTERFACE}" get power_save 2>/dev/null || true
+
+  printf '\n== rfkill ==\n'
+  rfkill list wifi 2>&1 || true
+
+  printf '\n== NetworkManager ==\n'
+  nmcli general status 2>&1 || true
+  nmcli device status 2>&1 || true
+  nmcli connection show "${CONNECTION_NAME}" 2>&1 |
+    grep -E '^(GENERAL.STATE|GENERAL.DEVICES|connection.id|connection.interface-name|connection.autoconnect|802-11-wireless.(ssid|mode|band|channel|powersave|cloned-mac-address|channel-width)|802-11-wireless-security.(key-mgmt|proto|pairwise|group|pmf)|ipv4.(method|addresses|gateway|never-default|ignore-auto-dns)|ipv6.method)' ||
+    true
+
+  printf '\n== Associated clients ==\n'
+  iw dev "${WIPI_INTERFACE}" station dump 2>&1 |
+    awk '/^Station / || /signal:/ || /connected time:/' || true
+
+  printf '\n== Routes and forwarding ==\n'
+  ip -4 route show 2>&1 || true
+  printf 'net.ipv4.ip_forward = %s\n' "$(read_ip_forwarding 2>/dev/null || printf unknown)"
+
+  printf '\n== WiPi firewall ==\n'
+  nft list table inet wipi_filter 2>&1 || printf 'No WiPi filter table.\n'
+  nft list table ip wipi_nat 2>/dev/null || true
+
+  printf '\n== Recent NetworkManager AP logs ==\n'
+  journalctl --no-pager -u NetworkManager --since '-30 minutes' 2>/dev/null |
+    grep -Ei "${WIPI_INTERFACE}|${CONNECTION_NAME}" |
+    tail -n 80 || true
+}
+
+show_credentials() {
+  require_root
+  [[ -r ${CONFIG_FILE} ]] || die "WiPi is not installed"
+  set_defaults
+  load_config
+  validate_logical_settings
+  printf 'SSID:     %s\n' "${WIPI_SSID}"
+  printf 'Password: %s\n' "${WIPI_PASSWORD}"
+}
+
+uninstall_wipi() {
+  require_root
+  (($# <= 1)) || die "usage: sudo wipi uninstall [--keep-config]"
+  local keep_config=0
+  case ${1:-} in
+    "") ;;
+    --keep-config) keep_config=1 ;;
+    *) die "usage: sudo wipi uninstall [--keep-config]" ;;
+  esac
+
+  if command_exists systemctl; then
+    systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  else
+    service_stop
+  fi
+  stop_dnsmasq
+  remove_firewall
+  restore_ip_forwarding
+
+  if command_exists nmcli; then
+    if connection_exists; then
+      nmcli connection delete "${CONNECTION_NAME}" >/dev/null
+    fi
+    if connection_exists_named "${LEGACY_CONNECTION_NAME}"; then
+      nmcli connection delete "${LEGACY_CONNECTION_NAME}" >/dev/null
+    fi
+  fi
+
+  rm -f "${UNIT_FILE}" "${INSTALLED_COMMAND}"
+  rm -rf -- "${RUN_DIR}" "${STATE_DIR}"
+  if ((keep_config == 0)); then
+    rm -rf -- "${CONFIG_DIR}"
+  fi
+  command_exists systemctl && systemctl daemon-reload
+  log "uninstalled WiPi-owned resources"
+  ((keep_config == 0)) || log "preserved ${CONFIG_FILE}"
+}
+
+show_configuration_help() {
+  cat <<'EOF'
+Configuration options:
+  --interface NAME             AP interface (default: wlan0)
+  --ssid NAME                  Wi-Fi network name
+  --password PASSWORD          WPA2 password; prefer the secure prompt
+  --address IPV4/24            AP address (only /24 is supported)
+  --hostname NAME              Local isolated-mode hostname
+  --country CODE               Two-letter regulatory country
+  --band 2.4|5                 Wi-Fi band
+  --channel NUMBER             2.4 GHz 1-13; 5 GHz 36/40/44/48
+  --mode routed|isolated       AP operating mode
+  --upstream-interface NAME    Routed interface; "auto" uses the route table
+EOF
+}
+
+show_help() {
+  cat <<EOF
+WiPi ${WIPI_VERSION}
+Usage: sudo wipi COMMAND [OPTIONS]
+
+Commands:
+  install [OPTIONS]            Install, configure, and start WiPi
+  configure [OPTIONS]          Update saved configuration
+  start                        Start the access point
+  stop                         Stop the access point
+  restart                      Restart the access point
+  status                       Show concise AP and mode state
+  mode routed|isolated         Persistently switch operating mode
+  credentials                  Explicitly display the SSID and password
+  diagnose                     Show concise AP troubleshooting information
+  uninstall [--keep-config]    Remove only WiPi-owned resources
+  help                         Show this help
+
+Examples:
+  sudo wipi install --mode isolated
+  sudo wipi configure --ssid management-ap --interface wlan0
+  sudo wipi mode routed
+  sudo wipi configure --mode routed --upstream-interface eth0
+EOF
+}
+
+main() {
+  local command=${1:-help}
+  (($# == 0)) || shift
+  case ${command} in
+    install)
+      install_wipi "$@"
+      ;;
+    configure)
+      configure_wipi "$@"
+      ;;
+    start)
+      require_no_arguments "${command}" "$@"
+      require_root
+      start_access_point
+      ;;
+    stop)
+      require_no_arguments "${command}" "$@"
+      require_root
+      stop_access_point
+      ;;
+    restart)
+      require_no_arguments "${command}" "$@"
+      require_root
+      restart_access_point
+      ;;
+    status)
+      require_no_arguments "${command}" "$@"
+      show_status
+      ;;
+    mode)
+      require_root
+      set_mode "$@"
+      ;;
+    credentials)
+      require_no_arguments "${command}" "$@"
+      show_credentials
+      ;;
+    diagnose)
+      require_no_arguments "${command}" "$@"
+      show_diagnostics
+      ;;
+    uninstall)
+      uninstall_wipi "$@"
+      ;;
+    help|-h|--help)
+      require_no_arguments "${command}" "$@"
+      show_help
+      ;;
+    _service-start)
+      require_no_arguments "${command}" "$@"
+      service_start
+      ;;
+    _service-stop)
+      require_no_arguments "${command}" "$@"
+      service_stop
+      ;;
+    *)
+      show_help >&2
+      die "unknown command '${command}'"
+      ;;
+  esac
+}
+
+if [[ ${WIPI_SOURCE_ONLY:-0} != "1" ]]; then
+  main "$@"
+fi
