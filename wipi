@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly WIPI_VERSION="2.0.0"
+readonly WIPI_VERSION="2.1.0"
 readonly CONNECTION_NAME="wipi"
 readonly LEGACY_CONNECTION_NAME="wipi-ap"
 readonly SERVICE_NAME="wipi.service"
+readonly DNS_SERVICE_NAME="wipi-dnsmasq.service"
+readonly ROUTING_TABLE_ID="4242"
+readonly ROUTING_TABLE_NAME="wipi"
+readonly POLICY_RULE_PRIORITY="10424"
+readonly DEFAULT_ADDRESS="10.10.0.1/24"
+readonly OLD_DEFAULT_ADDRESS="10.42.0.1/24"
 readonly TEST_ROOT="${WIPI_TEST_ROOT:-}"
 
 root_path() {
@@ -20,6 +26,12 @@ STATE_DIR=$(root_path /var/lib/wipi)
 readonly STATE_DIR
 UNIT_FILE=$(root_path /etc/systemd/system/wipi.service)
 readonly UNIT_FILE
+DNS_UNIT_FILE=$(root_path /etc/systemd/system/wipi-dnsmasq.service)
+readonly DNS_UNIT_FILE
+ROUTING_TABLE_FILE=$(root_path /etc/iproute2/rt_tables.d/wipi.conf)
+readonly ROUTING_TABLE_FILE
+DISPATCHER_FILE=$(root_path /etc/NetworkManager/dispatcher.d/90-wipi)
+readonly DISPATCHER_FILE
 INSTALLED_COMMAND=$(root_path /usr/local/bin/wipi)
 readonly INSTALLED_COMMAND
 readonly SYSTEMD_COMMAND="/usr/local/bin/wipi"
@@ -43,6 +55,18 @@ APT_UPDATED=0
 OPTION_COUNT=0
 BAND_WAS_OVERRIDDEN=0
 CHANNEL_WAS_OVERRIDDEN=0
+UPSTREAM_WAS_OVERRIDDEN=0
+CONFIG_MIGRATED=0
+AP_IPV4=""
+AP_SUBNET=""
+AP_NETMASK=""
+DHCP_START=""
+DHCP_END=""
+UPSTREAM_IPV4=""
+UPSTREAM_SUBNET=""
+UPSTREAM_GATEWAY=""
+UPSTREAM_ROUTE_LINES=""
+PINNED_DNS_SERVERS=""
 
 log() {
   printf '[wipi] %s\n' "$*"
@@ -101,13 +125,21 @@ set_defaults() {
   WIPI_INTERFACE="wlan0"
   WIPI_SSID="wipi"
   WIPI_PASSWORD=""
-  WIPI_ADDRESS="10.42.0.1/24"
+  WIPI_ADDRESS="${DEFAULT_ADDRESS}"
   WIPI_HOSTNAME="wipi.local"
   WIPI_COUNTRY="US"
   WIPI_BAND="2.4"
   WIPI_CHANNEL="6"
   WIPI_MODE="isolated"
   WIPI_UPSTREAM_INTERFACE=""
+}
+
+migrate_old_default_address() {
+  if [[ ${WIPI_ADDRESS} == "${OLD_DEFAULT_ADDRESS}" ]]; then
+    WIPI_ADDRESS="${DEFAULT_ADDRESS}"
+    CONFIG_MIGRATED=1
+    log "migrating the former default AP address to ${DEFAULT_ADDRESS}"
+  fi
 }
 
 is_config_key() {
@@ -182,6 +214,7 @@ apply_environment_overrides() {
     case ${ENV_OVERRIDE_KEYS[index]} in
       WIPI_BAND) BAND_WAS_OVERRIDDEN=1 ;;
       WIPI_CHANNEL) CHANNEL_WAS_OVERRIDDEN=1 ;;
+      WIPI_UPSTREAM_INTERFACE) UPSTREAM_WAS_OVERRIDDEN=1 ;;
     esac
   done
 }
@@ -261,7 +294,72 @@ validate_country() {
 
 validate_ipv4_octet() {
   [[ $1 =~ ^[0-9]{1,3}$ ]] || return 1
+  [[ $1 == "0" || $1 != 0* ]] || return 1
   ((10#$1 >= 0 && 10#$1 <= 255))
+}
+
+ipv4_to_int() {
+  local address=$1 first second third fourth value
+  IFS=. read -r first second third fourth <<<"${address}"
+  validate_ipv4_octet "${first:-}" &&
+    validate_ipv4_octet "${second:-}" &&
+    validate_ipv4_octet "${third:-}" &&
+    validate_ipv4_octet "${fourth:-}" || return 1
+  value=$(( \
+    (10#${first} << 24) |
+      (10#${second} << 16) |
+      (10#${third} << 8) |
+      10#${fourth} \
+  ))
+  printf '%u\n' "${value}"
+}
+
+int_to_ipv4() {
+  local value=$1
+  printf '%d.%d.%d.%d\n' \
+    "$(((value >> 24) & 255))" \
+    "$(((value >> 16) & 255))" \
+    "$(((value >> 8) & 255))" \
+    "$((value & 255))"
+}
+
+cidr_network() {
+  local cidr=$1 address prefix address_int mask network
+  [[ ${cidr} =~ ^([^/]+)/([0-9]+)$ ]] || return 1
+  address=${BASH_REMATCH[1]}
+  prefix=${BASH_REMATCH[2]}
+  ((prefix >= 0 && prefix <= 32)) || return 1
+  address_int=$(ipv4_to_int "${address}") || return 1
+  if ((prefix == 0)); then
+    mask=0
+  else
+    mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+  fi
+  network=$((address_int & mask))
+  printf '%s/%s\n' "$(int_to_ipv4 "${network}")" "${prefix}"
+}
+
+cidr_bounds() {
+  local cidr=$1 network_cidr prefix network_int mask broadcast
+  network_cidr=$(cidr_network "${cidr}") || return 1
+  prefix=${network_cidr#*/}
+  network_int=$(ipv4_to_int "${network_cidr%/*}") || return 1
+  if ((prefix == 0)); then
+    mask=0
+  else
+    mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+  fi
+  broadcast=$((network_int | ((~mask) & 0xFFFFFFFF)))
+  printf '%s %s\n' "${network_int}" "${broadcast}"
+}
+
+cidrs_overlap() {
+  local first_bounds second_bounds first_start first_end second_start second_end
+  first_bounds=$(cidr_bounds "$1") || return 1
+  second_bounds=$(cidr_bounds "$2") || return 1
+  read -r first_start first_end <<<"${first_bounds}"
+  read -r second_start second_end <<<"${second_bounds}"
+  ((first_start <= second_end && second_start <= first_end))
 }
 
 validate_address() {
@@ -282,6 +380,10 @@ validate_address() {
   done
   ((10#${octets[3]} >= 1 && 10#${octets[3]} <= 254)) ||
     die "AP address cannot be the network or broadcast address"
+  AP_IPV4=${address}
+  AP_SUBNET=$(cidr_network "${WIPI_ADDRESS}") ||
+    die "address must be an IPv4 CIDR"
+  AP_NETMASK="255.255.255.0"
 }
 
 validate_hostname() {
@@ -339,8 +441,119 @@ validate_logical_settings() {
       die "upstream interface cannot be the AP interface"
   fi
   if [[ ${WIPI_MODE} == "isolated" ]]; then
+    if ((UPSTREAM_WAS_OVERRIDDEN == 1)) &&
+      [[ -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
+      die "isolated mode cannot use an upstream interface"
+    fi
     WIPI_UPSTREAM_INTERFACE=""
   fi
+}
+
+collect_upstream_dns() {
+  PINNED_DNS_SERVERS=""
+  local output line server
+  output=$(nmcli --terse --escape no --fields IP4.DNS \
+    device show "${WIPI_UPSTREAM_INTERFACE}" 2>/dev/null || true)
+  while IFS= read -r line; do
+    [[ -n ${line} ]] || continue
+    server=${line#*:}
+    ipv4_to_int "${server}" >/dev/null 2>&1 || continue
+    [[ ${server} != "0.0.0.0" && ${server} != 169.254.* ]] || continue
+    if ! grep -Fxq "${server}" <<<"${PINNED_DNS_SERVERS}"; then
+      if [[ -n ${PINNED_DNS_SERVERS} ]]; then
+        PINNED_DNS_SERVERS+=$'\n'
+      fi
+      PINNED_DNS_SERVERS+="${server}"
+    fi
+  done <<<"${output}"
+}
+
+validate_pinned_upstream() {
+  local interface=${WIPI_UPSTREAM_INTERFACE}
+  local link_output flags wireless_info address_lines cidr route_lines
+  local route destination useful_route=0 default_route
+
+  [[ ${interface} != wipi* ]] ||
+    die "Pinned routed mode cannot start: ${interface} is WiPi-owned."
+  link_output=$(ip -o link show dev "${interface}" 2>/dev/null) ||
+    die "Pinned routed mode cannot start: ${interface} does not exist."
+  flags=${link_output#*<}
+  flags=${flags%%>*}
+  [[ ,${flags}, == *,UP,* ]] ||
+    die "Pinned routed mode cannot start: ${interface} is down."
+
+  local carrier_path="${WIPI_SYS_CLASS_NET_ROOT:-/sys/class/net}/${interface}/carrier"
+  if [[ -r ${carrier_path} && $(<"${carrier_path}") != "1" ]]; then
+    die "Pinned routed mode cannot start: ${interface} has no carrier."
+  fi
+
+  wireless_info=$(iw dev "${interface}" info 2>/dev/null || true)
+  if grep -Eq '^[[:space:]]*type[[:space:]]+monitor([[:space:]]|$)' \
+    <<<"${wireless_info}"; then
+    die "Pinned routed mode cannot start: ${interface} is in monitor mode."
+  fi
+
+  address_lines=$(ip -o -4 address show dev "${interface}" \
+    scope global 2>/dev/null || true)
+  cidr=$(awk '$3 == "inet" && $4 !~ /^169\\.254\\./ {print $4; exit}' \
+    <<<"${address_lines}")
+  [[ -n ${cidr} ]] ||
+    die "Pinned routed mode cannot start: ${interface} has no IPv4 address."
+  UPSTREAM_IPV4=${cidr%/*}
+  UPSTREAM_SUBNET=$(cidr_network "${cidr}") ||
+    die "Pinned routed mode cannot start: ${interface} has an invalid IPv4 address."
+  if cidrs_overlap "${AP_SUBNET}" "${UPSTREAM_SUBNET}"; then
+    die "Pinned routed mode cannot start: ${AP_SUBNET} overlaps ${interface}."
+  fi
+
+  route_lines=$(ip -4 route show dev "${interface}" 2>/dev/null || true)
+  while IFS= read -r route; do
+    [[ -n ${route} ]] || continue
+    destination=${route%% *}
+    if [[ ${destination} == "default" ]] ||
+      cidr_network "${destination}" >/dev/null 2>&1; then
+      useful_route=1
+    fi
+  done <<<"${route_lines}"
+  ((useful_route == 1)) ||
+    die "Pinned routed mode cannot start: no usable route is associated with ${interface}."
+  UPSTREAM_ROUTE_LINES=${route_lines}
+
+  UPSTREAM_GATEWAY=""
+  default_route=$(ip -4 route show default dev "${interface}" 2>/dev/null |
+    head -n 1)
+  if [[ -n ${default_route} ]]; then
+    UPSTREAM_GATEWAY=$(awk '
+      {for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}
+    ' <<<"${default_route}")
+    if [[ -n ${UPSTREAM_GATEWAY} ]] &&
+      ! ipv4_to_int "${UPSTREAM_GATEWAY}" >/dev/null 2>&1; then
+      die "Pinned routed mode cannot start: ${interface} has an invalid gateway."
+    fi
+  fi
+  collect_upstream_dns
+}
+
+validate_subnet_overlaps() {
+  local lines line interface cidr
+  if ! lines=$(ip -o -4 address show up scope global 2>/dev/null); then
+    die "could not inspect active IPv4 subnets"
+  fi
+  while IFS= read -r line; do
+    [[ -n ${line} ]] || continue
+    interface=$(awk '{print $2}' <<<"${line}")
+    interface=${interface%%@*}
+    cidr=$(awk '$3 == "inet" {print $4; exit}' <<<"${line}")
+    [[ -n ${interface} && -n ${cidr} ]] || continue
+    [[ ${interface} == "${WIPI_INTERFACE}" ]] && continue
+    if [[ -n ${WIPI_UPSTREAM_INTERFACE} &&
+      ${interface} == "${WIPI_UPSTREAM_INTERFACE}" ]]; then
+      continue
+    fi
+    if cidrs_overlap "${AP_SUBNET}" "${cidr}"; then
+      die "AP subnet ${AP_SUBNET} overlaps ${cidr} on ${interface}"
+    fi
+  done <<<"${lines}"
 }
 
 validate_hardware() {
@@ -371,9 +584,9 @@ validate_hardware() {
   fi
 
   if [[ -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
-    ip link show dev "${WIPI_UPSTREAM_INTERFACE}" >/dev/null 2>&1 ||
-      die "upstream interface '${WIPI_UPSTREAM_INTERFACE}' does not exist"
+    validate_pinned_upstream
   fi
+  validate_subnet_overlaps
 }
 
 validate_settings() {
@@ -433,6 +646,7 @@ parse_configuration_options() {
         ;;
       --upstream-interface)
         (($# >= 2)) || die "$1 requires a value"
+        UPSTREAM_WAS_OVERRIDDEN=1
         if [[ $2 == "auto" || $2 == "none" ]]; then
           WIPI_UPSTREAM_INTERFACE=""
         else
@@ -492,8 +706,11 @@ prepare_configuration() {
   capture_environment_overrides
   BAND_WAS_OVERRIDDEN=0
   CHANNEL_WAS_OVERRIDDEN=0
+  UPSTREAM_WAS_OVERRIDDEN=0
+  CONFIG_MIGRATED=0
   set_defaults
   load_config
+  migrate_old_default_address
   apply_environment_overrides
   parse_configuration_options "$@"
   if ((BAND_WAS_OVERRIDDEN == 1 && CHANNEL_WAS_OVERRIDDEN == 0)); then
@@ -608,7 +825,8 @@ configure_profile() {
     die "could not configure the NetworkManager profile"
   fi
 
-  if [[ ${WIPI_MODE} == "routed" ]]; then
+  if [[ ${WIPI_MODE} == "routed" &&
+    -z ${WIPI_UPSTREAM_INTERFACE} ]]; then
     nmcli connection modify "${CONNECTION_NAME}" \
       ipv4.method shared \
       ipv4.addresses "${WIPI_ADDRESS}" \
@@ -633,7 +851,7 @@ configure_profile() {
 
 write_systemd_unit() {
   install -d -m 755 "$(dirname "${UNIT_FILE}")"
-  local temporary
+  local temporary dns_temporary
   temporary=$(mktemp "${UNIT_FILE}.tmp.XXXXXX")
   cat >"${temporary}" <<EOF
 [Unit]
@@ -654,6 +872,45 @@ WantedBy=multi-user.target
 EOF
   chmod 644 "${temporary}"
   mv -f "${temporary}" "${UNIT_FILE}"
+
+  dns_temporary=$(mktemp "${DNS_UNIT_FILE}.tmp.XXXXXX")
+  cat >"${dns_temporary}" <<'EOF'
+[Unit]
+Description=WiPi dedicated DHCP and DNS
+PartOf=wipi.service
+After=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/test -r /run/wipi/dnsmasq.conf
+ExecStart=/usr/sbin/dnsmasq --no-daemon --conf-file=/run/wipi/dnsmasq.conf --pid-file=/run/wipi/dnsmasq.pid
+Restart=on-failure
+RestartSec=2
+EOF
+  chmod 644 "${dns_temporary}"
+  mv -f "${dns_temporary}" "${DNS_UNIT_FILE}"
+}
+
+write_routing_table_file() {
+  install -d -m 755 "$(dirname "${ROUTING_TABLE_FILE}")"
+  local temporary
+  temporary=$(mktemp "${ROUTING_TABLE_FILE}.tmp.XXXXXX")
+  printf '%s %s\n' "${ROUTING_TABLE_ID}" "${ROUTING_TABLE_NAME}" \
+    >"${temporary}"
+  chmod 644 "${temporary}"
+  mv -f "${temporary}" "${ROUTING_TABLE_FILE}"
+}
+
+write_network_dispatcher() {
+  install -d -m 755 "$(dirname "${DISPATCHER_FILE}")"
+  local temporary
+  temporary=$(mktemp "${DISPATCHER_FILE}.tmp.XXXXXX")
+  cat >"${temporary}" <<EOF
+#!/bin/sh
+exec ${SYSTEMD_COMMAND} _network-changed "\$1" "\$2"
+EOF
+  chmod 755 "${temporary}"
+  mv -f "${temporary}" "${DISPATCHER_FILE}"
 }
 
 install_command() {
@@ -669,6 +926,7 @@ dhcp_values() {
   local first second third host
   IFS=. read -r first second third host <<<"${address}"
   AP_IPV4=${address}
+  AP_SUBNET=$(cidr_network "${WIPI_ADDRESS}")
   AP_NETMASK="255.255.255.0"
   if ((10#${host} >= 10 && 10#${host} <= 100)); then
     DHCP_START="${first}.${second}.${third}.101"
@@ -696,6 +954,15 @@ no-hosts
 domain-needed
 bogus-priv
 EOF
+  if [[ ${WIPI_MODE} == "routed" &&
+    -n ${WIPI_UPSTREAM_INTERFACE} &&
+    -n ${PINNED_DNS_SERVERS} ]]; then
+    local server
+    while IFS= read -r server; do
+      [[ -n ${server} ]] &&
+        printf 'server=%s@%s\n' "${server}" "${WIPI_UPSTREAM_INTERFACE}"
+    done <<<"${PINNED_DNS_SERVERS}"
+  fi
 }
 
 write_dnsmasq_config() {
@@ -707,48 +974,28 @@ write_dnsmasq_config() {
   mv -f "${temporary}" "${RUN_DIR}/dnsmasq.conf"
 }
 
-dnsmasq_is_running() {
-  local pid_file="${RUN_DIR}/dnsmasq.pid"
-  [[ -r ${pid_file} ]] || return 1
-  local pid
-  pid=$(<"${pid_file}")
-  [[ ${pid} =~ ^[0-9]+$ && -r "/proc/${pid}/cmdline" ]] || return 1
-  tr '\0' ' ' <"/proc/${pid}/cmdline" |
-    grep -Fq "${RUN_DIR}/dnsmasq.conf"
-}
-
 stop_dnsmasq() {
-  local pid_file="${RUN_DIR}/dnsmasq.pid"
-  if dnsmasq_is_running; then
-    local pid
-    pid=$(<"${pid_file}")
-    kill "${pid}" 2>/dev/null || true
-    local remaining=20
-    while ((remaining > 0)); do
-      kill -0 "${pid}" 2>/dev/null || break
-      sleep 0.1
-      remaining=$((remaining - 1))
-    done
-    if kill -0 "${pid}" 2>/dev/null; then
-      kill -KILL "${pid}" 2>/dev/null || true
-    fi
+  if command_exists systemctl; then
+    systemctl stop "${DNS_SERVICE_NAME}" >/dev/null 2>&1 || true
   fi
-  rm -f "${pid_file}" "${RUN_DIR}/dnsmasq.conf"
+  rm -f "${RUN_DIR}/dnsmasq.pid" "${RUN_DIR}/dnsmasq.conf"
 }
 
 start_dnsmasq() {
   stop_dnsmasq
   write_dnsmasq_config
-  if ! dnsmasq \
-    --conf-file="${RUN_DIR}/dnsmasq.conf" \
-    --pid-file="${RUN_DIR}/dnsmasq.pid"; then
-    warn "dnsmasq failed to start"
+  if ! systemctl restart "${DNS_SERVICE_NAME}"; then
+    warn "the supervised WiPi dnsmasq service failed to start"
     return 1
   fi
-  if ! dnsmasq_is_running; then
-    warn "isolated DHCP/DNS service did not stay running"
+  if ! systemctl is-active --quiet "${DNS_SERVICE_NAME}"; then
+    warn "the supervised WiPi dnsmasq service is not active"
     return 1
   fi
+}
+
+dnsmasq_is_running() {
+  systemctl is-active --quiet "${DNS_SERVICE_NAME}" 2>/dev/null
 }
 
 render_firewall() {
@@ -756,9 +1003,11 @@ render_firewall() {
     cat <<EOF
 table inet wipi_filter {
   chain forward {
-    type filter hook forward priority -5; policy accept;
-    iifname "${WIPI_INTERFACE}" drop comment "WiPi blocks AP client forwarding"
-    oifname "${WIPI_INTERFACE}" drop comment "WiPi blocks forwarding to AP clients"
+    type filter hook forward priority -150; policy accept;
+    iifname "${WIPI_INTERFACE}" ip saddr ${AP_SUBNET} drop comment "wipi isolated outbound"
+    oifname "${WIPI_INTERFACE}" ip daddr ${AP_SUBNET} drop comment "wipi isolated inbound"
+    iifname "${WIPI_INTERFACE}" drop comment "wipi isolated spoof guard"
+    oifname "${WIPI_INTERFACE}" drop comment "wipi isolated destination guard"
   }
 }
 EOF
@@ -766,11 +1015,19 @@ EOF
     cat <<EOF
 table inet wipi_filter {
   chain forward {
-    type filter hook forward priority -5; policy accept;
-    iifname "${WIPI_INTERFACE}" oifname "${WIPI_UPSTREAM_INTERFACE}" accept comment "WiPi pinned upstream"
-    iifname "${WIPI_INTERFACE}" drop comment "WiPi blocks unrelated upstreams"
-    iifname "${WIPI_UPSTREAM_INTERFACE}" oifname "${WIPI_INTERFACE}" ct state established,related accept comment "WiPi allows replies"
-    oifname "${WIPI_INTERFACE}" drop comment "WiPi blocks new inbound sessions"
+    type filter hook forward priority -150; policy accept;
+    iifname "${WIPI_INTERFACE}" ip saddr ${AP_SUBNET} oifname "${WIPI_UPSTREAM_INTERFACE}" accept comment "wipi pinned outbound"
+    iifname "${WIPI_INTERFACE}" ip saddr ${AP_SUBNET} drop comment "wipi pinned other egress drop"
+    iifname "${WIPI_UPSTREAM_INTERFACE}" oifname "${WIPI_INTERFACE}" ip daddr ${AP_SUBNET} ct state established,related accept comment "wipi pinned replies"
+    oifname "${WIPI_INTERFACE}" ip daddr ${AP_SUBNET} drop comment "wipi pinned inbound drop"
+    iifname "${WIPI_INTERFACE}" drop comment "wipi pinned spoof guard"
+    oifname "${WIPI_INTERFACE}" drop comment "wipi pinned destination guard"
+  }
+}
+table ip wipi_nat {
+  chain postrouting {
+    type nat hook postrouting priority 100; policy accept;
+    iifname "${WIPI_INTERFACE}" ip saddr ${AP_SUBNET} oifname "${WIPI_UPSTREAM_INTERFACE}" masquerade comment "wipi pinned nat"
   }
 }
 EOF
@@ -794,6 +1051,263 @@ apply_firewall() {
   fi
 }
 
+nft_filter_text() {
+  nft list table inet wipi_filter 2>/dev/null || true
+}
+
+nft_nat_text() {
+  nft list table ip wipi_nat 2>/dev/null || true
+}
+
+isolated_filter_is_active() {
+  local rules
+  rules=$(nft_filter_text)
+  [[ ${rules} == *"iifname \"${WIPI_INTERFACE}\" ip saddr ${AP_SUBNET} drop"* ]] &&
+    [[ ${rules} == *"oifname \"${WIPI_INTERFACE}\" ip daddr ${AP_SUBNET} drop"* ]]
+}
+
+pinned_filter_is_active() {
+  local rules outbound_count accept_count
+  rules=$(nft_filter_text)
+  [[ ${rules} == *"iifname \"${WIPI_INTERFACE}\" ip saddr ${AP_SUBNET} oifname \"${WIPI_UPSTREAM_INTERFACE}\" accept"* ]] ||
+    return 1
+  [[ ${rules} == *"iifname \"${WIPI_INTERFACE}\" ip saddr ${AP_SUBNET} drop"* ]] ||
+    return 1
+  [[ ${rules} == *"iifname \"${WIPI_UPSTREAM_INTERFACE}\" oifname \"${WIPI_INTERFACE}\" ip daddr ${AP_SUBNET} ct state established,related accept"* ]] ||
+    return 1
+  [[ ${rules} == *"oifname \"${WIPI_INTERFACE}\" ip daddr ${AP_SUBNET} drop"* ]] ||
+    return 1
+  outbound_count=$(grep -Fc 'comment "wipi pinned outbound"' <<<"${rules}" ||
+    true)
+  accept_count=$(grep -c ' accept comment' <<<"${rules}" || true)
+  [[ ${outbound_count} == "1" && ${accept_count} == "2" ]]
+}
+
+pinned_nat_is_active() {
+  local rules masquerade_count all_rules ap_masquerade_count
+  rules=$(nft_nat_text)
+  [[ ${rules} == *"iifname \"${WIPI_INTERFACE}\" ip saddr ${AP_SUBNET} oifname \"${WIPI_UPSTREAM_INTERFACE}\" masquerade"* ]] ||
+    return 1
+  masquerade_count=$(grep -c ' masquerade' <<<"${rules}" || true)
+  [[ ${masquerade_count} == "1" ]] || return 1
+  all_rules=$(nft list ruleset 2>/dev/null || true)
+  ap_masquerade_count=$(grep -F "${AP_SUBNET}" <<<"${all_rules}" |
+    grep -c ' masquerade' || true)
+  [[ ${ap_masquerade_count} == "1" ]]
+}
+
+wipi_nat_is_absent() {
+  [[ -z $(nft_nat_text) ]]
+}
+
+ap_nat_is_absent() {
+  local rules
+  rules=$(nft list ruleset 2>/dev/null || true)
+  ! grep -F "${AP_SUBNET}" <<<"${rules}" | grep -q ' masquerade'
+}
+
+automatic_nat_runtime_state() {
+  local rules
+  rules=$(nft list ruleset 2>/dev/null || true)
+  if grep -F "${AP_SUBNET}" <<<"${rules}" | grep -q 'masquerade'; then
+    printf 'verified\n'
+  else
+    printf 'unverified\n'
+  fi
+}
+
+dnsmasq_configuration_is_safe() {
+  [[ -r ${RUN_DIR}/dnsmasq.conf ]] || return 1
+  local configuration server expected_count=0 actual_count
+  configuration=$(<"${RUN_DIR}/dnsmasq.conf")
+  grep -Fxq 'no-resolv' <<<"${configuration}" || return 1
+  grep -Fxq "address=/${WIPI_HOSTNAME}/${AP_IPV4}" \
+    <<<"${configuration}" || return 1
+  if [[ ${WIPI_MODE} == "isolated" ]]; then
+    if grep -q '^server=' <<<"${configuration}"; then
+      return 1
+    fi
+    return 0
+  fi
+  while IFS= read -r server; do
+    [[ -n ${server} ]] || continue
+    grep -Fxq "server=${server}@${WIPI_UPSTREAM_INTERFACE}" \
+      <<<"${configuration}" || return 1
+    expected_count=$((expected_count + 1))
+  done <<<"${PINNED_DNS_SERVERS}"
+  actual_count=$(grep -c '^server=' <<<"${configuration}" || true)
+  [[ ${actual_count} == "${expected_count}" ]]
+}
+
+policy_rule_text() {
+  ip -4 rule show 2>/dev/null |
+    awk -v priority="${POLICY_RULE_PRIORITY}:" \
+      '$1 == priority {print}'
+}
+
+routing_table_is_owned() {
+  [[ -e ${STATE_DIR}/routing-table-4242.owned ]]
+}
+
+claim_routing_table() {
+  routing_table_is_owned && return 0
+  local existing_routes existing_rules
+  existing_routes=$(ip -4 route show table "${ROUTING_TABLE_ID}" \
+    2>/dev/null || true)
+  existing_rules=$(ip -4 rule show 2>/dev/null |
+    grep -E "lookup (${ROUTING_TABLE_ID}|${ROUTING_TABLE_NAME})([[:space:]]|$)" ||
+    true)
+  [[ -z ${existing_routes} && -z ${existing_rules} ]] ||
+    die "Pinned routed mode cannot start: routing table ${ROUTING_TABLE_ID} is already in use."
+  install -d -m 700 "${STATE_DIR}"
+  : >"${STATE_DIR}/routing-table-4242.owned"
+  chmod 600 "${STATE_DIR}/routing-table-4242.owned"
+}
+
+remove_policy_routing() {
+  command_exists ip || return 0
+  routing_table_is_owned || return 0
+  local rule
+  while :; do
+    rule=$(policy_rule_text)
+    [[ ${rule} == *"lookup ${ROUTING_TABLE_ID}"* ||
+      ${rule} == *"lookup ${ROUTING_TABLE_NAME}"* ]] || break
+    ip -4 rule delete priority "${POLICY_RULE_PRIORITY}" \
+      table "${ROUTING_TABLE_ID}" >/dev/null 2>&1 || break
+  done
+  ip -4 route flush table "${ROUTING_TABLE_ID}" >/dev/null 2>&1 || true
+}
+
+route_field() {
+  local line=$1 field=$2
+  awk -v wanted="${field}" '
+    {for (i=1; i<=NF; i++) if ($i == wanted) {print $(i+1); exit}}
+  ' <<<"${line}"
+}
+
+normalize_route_destination() {
+  local destination=$1
+  if [[ ${destination} == "default" ]]; then
+    printf 'default\n'
+  elif [[ ${destination} == */* ]]; then
+    cidr_network "${destination}"
+  elif ipv4_to_int "${destination}" >/dev/null 2>&1; then
+    printf '%s/32\n' "${destination}"
+  else
+    return 1
+  fi
+}
+
+apply_policy_routing() {
+  local existing route destination normalized gateway
+  local default_added=0
+  remove_policy_routing
+  existing=$(policy_rule_text)
+  [[ -z ${existing} ]] ||
+    die "Pinned routed mode cannot start: policy-rule priority ${POLICY_RULE_PRIORITY} is already in use."
+
+  ip -4 route replace table "${ROUTING_TABLE_ID}" \
+    "${AP_SUBNET}" dev "${WIPI_INTERFACE}" scope link src "${AP_IPV4}" ||
+    die "Pinned routed mode cannot start: could not add the AP-local route."
+  ip -4 route replace table "${ROUTING_TABLE_ID}" \
+    "${UPSTREAM_SUBNET}" dev "${WIPI_UPSTREAM_INTERFACE}" \
+    scope link src "${UPSTREAM_IPV4}" ||
+    die "Pinned routed mode cannot start: could not add the upstream connected route."
+
+  while IFS= read -r route; do
+    [[ -n ${route} ]] || continue
+    destination=${route%% *}
+    normalized=$(normalize_route_destination "${destination}" 2>/dev/null ||
+      true)
+    [[ -n ${normalized} ]] || continue
+    if [[ ${normalized} == "default" ]]; then
+      ((default_added == 0)) || continue
+      default_added=1
+    fi
+    if [[ ${normalized} != "default" ]] &&
+      cidrs_overlap "${AP_SUBNET}" "${normalized}"; then
+      continue
+    fi
+    gateway=$(route_field "${route}" via)
+    if [[ -n ${gateway} ]]; then
+      ipv4_to_int "${gateway}" >/dev/null 2>&1 || continue
+      ip -4 route replace table "${ROUTING_TABLE_ID}" \
+        "${normalized}" via "${gateway}" dev "${WIPI_UPSTREAM_INTERFACE}" \
+        src "${UPSTREAM_IPV4}" ||
+        die "Pinned routed mode cannot start: could not copy route ${normalized}."
+    else
+      ip -4 route replace table "${ROUTING_TABLE_ID}" \
+        "${normalized}" dev "${WIPI_UPSTREAM_INTERFACE}" \
+        src "${UPSTREAM_IPV4}" ||
+        die "Pinned routed mode cannot start: could not copy route ${normalized}."
+    fi
+  done <<<"${UPSTREAM_ROUTE_LINES}"
+
+  ip -4 rule add priority "${POLICY_RULE_PRIORITY}" \
+    iif "${WIPI_INTERFACE}" from "${AP_SUBNET}" \
+    lookup "${ROUTING_TABLE_ID}" ||
+    die "Pinned routed mode cannot start: could not install the source policy rule."
+}
+
+policy_rule_is_active() {
+  local rule matching_count
+  rule=$(policy_rule_text)
+  [[ ${rule} == *"from ${AP_SUBNET}"* ]] || return 1
+  [[ ${rule} == *"iif ${WIPI_INTERFACE}"* ]] || return 1
+  [[ ${rule} == *"lookup ${ROUTING_TABLE_ID}"* ||
+    ${rule} == *"lookup ${ROUTING_TABLE_NAME}"* ]] || return 1
+  matching_count=$(ip -4 rule show 2>/dev/null |
+    grep -Ec "lookup (${ROUTING_TABLE_ID}|${ROUTING_TABLE_NAME})([[:space:]]|$)" ||
+    true)
+  [[ ${matching_count} == "1" ]]
+}
+
+route_verification_destination() {
+  if [[ -n ${UPSTREAM_GATEWAY} ]]; then
+    printf '%s\n' "${UPSTREAM_GATEWAY}"
+    return
+  fi
+  if [[ -n ${PINNED_DNS_SERVERS} ]]; then
+    printf '%s\n' "${PINNED_DNS_SERVERS%%$'\n'*}"
+    return
+  fi
+  local network_int
+  network_int=$(ipv4_to_int "${UPSTREAM_SUBNET%/*}")
+  int_to_ipv4 "$((network_int + 1))"
+}
+
+routing_table_is_valid() {
+  local table route_test destination line device
+  table=$(ip -4 route show table "${ROUTING_TABLE_ID}" 2>/dev/null || true)
+  grep -Fq "${AP_SUBNET} dev ${WIPI_INTERFACE}" <<<"${table}" || return 1
+  grep -Fq "${UPSTREAM_SUBNET} dev ${WIPI_UPSTREAM_INTERFACE}" \
+    <<<"${table}" || return 1
+  while IFS= read -r line; do
+    [[ -n ${line} ]] || continue
+    device=$(route_field "${line}" dev)
+    [[ -z ${device} || ${device} == "${WIPI_INTERFACE}" ||
+      ${device} == "${WIPI_UPSTREAM_INTERFACE}" ]] || return 1
+  done <<<"${table}"
+  destination=$(route_verification_destination)
+  route_test=$(ip -4 route get "${destination}" from "${DHCP_START}" \
+    iif "${WIPI_INTERFACE}" 2>/dev/null || true)
+  [[ ${route_test} == *"dev ${WIPI_UPSTREAM_INTERFACE}"* ]] || return 1
+  [[ ${route_test} == *"table ${ROUTING_TABLE_ID}"* ||
+    ${route_test} == *"table ${ROUTING_TABLE_NAME}"* ]]
+}
+
+pinned_dns_routes_are_valid() {
+  local server route_test
+  while IFS= read -r server; do
+    [[ -n ${server} ]] || continue
+    route_test=$(ip -4 route get "${server}" from "${DHCP_START}" \
+      iif "${WIPI_INTERFACE}" 2>/dev/null || true)
+    [[ ${route_test} == *"dev ${WIPI_UPSTREAM_INTERFACE}"* ]] || return 1
+    [[ ${route_test} == *"table ${ROUTING_TABLE_ID}"* ||
+      ${route_test} == *"table ${ROUTING_TABLE_NAME}"* ]] || return 1
+  done <<<"${PINNED_DNS_SERVERS}"
+}
+
 read_ip_forwarding() {
   sysctl -n net.ipv4.ip_forward
 }
@@ -809,6 +1323,7 @@ enable_ip_forwarding() {
   if [[ ${previous} != "1" ]]; then
     sysctl -q -w net.ipv4.ip_forward=1
     : >"${STATE_DIR}/ip_forward.changed"
+    chmod 600 "${STATE_DIR}/ip_forward.changed"
   fi
 }
 
@@ -843,15 +1358,81 @@ rollback_runtime() {
   stop_dnsmasq
   nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
   remove_firewall
+  remove_policy_routing
   restore_ip_forwarding
 }
 
-startup_error() {
+startup_exit() {
   local status=$?
-  trap - ERR
+  trap - EXIT ERR
   rollback_runtime || true
-  warn "startup failed; WiPi-owned runtime resources were rolled back"
+  warn "startup failed; WiPi-owned firewall, NAT, policy-routing, and DNS state were rolled back"
   return "${status}"
+}
+
+startup_command_error() {
+  local line=$1 command=$2
+  warn "startup command failed at line ${line}: ${command}"
+  return 1
+}
+
+verify_runtime_for_mode() {
+  profile_is_active || {
+    warn "runtime verification failed: the WiPi profile is inactive"
+    return 1
+  }
+  if [[ ${WIPI_MODE} == "isolated" ]]; then
+    isolated_filter_is_active || {
+      warn "runtime verification failed: the isolated forwarding filter is missing"
+      return 1
+    }
+    if ! { wipi_nat_is_absent && ap_nat_is_absent; }; then
+      warn "runtime verification failed: isolated mode has unexpected WiPi NAT"
+      return 1
+    fi
+    [[ -z $(policy_rule_text) ]] || {
+      warn "runtime verification failed: isolated mode has stale policy routing"
+      return 1
+    }
+    if ! { dnsmasq_is_running && dnsmasq_configuration_is_safe; }; then
+      warn "runtime verification failed: isolated DHCP/DNS is unhealthy"
+      return 1
+    fi
+  elif [[ -z ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    [[ -z $(policy_rule_text) ]] || {
+      warn "runtime verification failed: automatic mode has stale policy routing"
+      return 1
+    }
+    wipi_nat_is_absent || {
+      warn "runtime verification failed: automatic mode has stale WiPi NAT"
+      return 1
+    }
+    [[ $(profile_value ipv4.method) == "shared" ]] || {
+      warn "runtime verification failed: NetworkManager sharing is not configured"
+      return 1
+    }
+  else
+    policy_rule_is_active || {
+      warn "runtime verification failed: the pinned source rule is missing"
+      return 1
+    }
+    routing_table_is_valid || {
+      warn "runtime verification failed: routing table ${ROUTING_TABLE_ID} is invalid"
+      return 1
+    }
+    pinned_filter_is_active || {
+      warn "runtime verification failed: the pinned forwarding filter is incomplete"
+      return 1
+    }
+    pinned_nat_is_active || {
+      warn "runtime verification failed: the pinned NAT rule is missing or incorrect"
+      return 1
+    }
+    if ! { dnsmasq_is_running && dnsmasq_configuration_is_safe; }; then
+      warn "runtime verification failed: pinned DHCP/DNS is unhealthy"
+      return 1
+    fi
+  fi
 }
 
 service_start() {
@@ -860,14 +1441,27 @@ service_start() {
   connection_exists || die "NetworkManager profile '${CONNECTION_NAME}' is missing"
   set_defaults
   load_config
+  migrate_old_default_address
   validate_logical_settings
   configure_country
+  validate_hardware
+  dhcp_values
+  if ((CONFIG_MIGRATED == 1)); then
+    configure_profile
+    write_config
+  fi
+  if [[ ${WIPI_MODE} == "routed" &&
+    -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    claim_routing_table
+  fi
 
-  trap startup_error ERR
+  trap 'startup_command_error "${LINENO}" "${BASH_COMMAND}"' ERR
+  trap startup_exit EXIT
   install -d -m 700 "${RUN_DIR}" "${STATE_DIR}"
   stop_dnsmasq
   nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
   remove_firewall
+  remove_policy_routing
 
   if [[ ${WIPI_MODE} == "routed" ]]; then
     enable_ip_forwarding
@@ -875,18 +1469,28 @@ service_start() {
     restore_ip_forwarding
   fi
 
-  if ! apply_firewall || ! activate_profile; then
-    rollback_runtime
-    die "access-point startup failed and WiPi-owned resources were rolled back"
+  apply_firewall ||
+    die "could not apply mode-specific WiPi nftables state"
+  activate_profile ||
+    die "could not activate the WiPi NetworkManager profile"
+
+  if [[ ${WIPI_MODE} == "routed" &&
+    -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    apply_policy_routing
   fi
 
-  if [[ ${WIPI_MODE} == "isolated" ]]; then
+  if [[ ${WIPI_MODE} == "isolated" ||
+    (${WIPI_MODE} == "routed" && -n ${WIPI_UPSTREAM_INTERFACE}) ]]; then
+    if [[ ${WIPI_MODE} == "routed" && -z ${PINNED_DNS_SERVERS} ]]; then
+      warn "${WIPI_UPSTREAM_INTERFACE} has no usable NetworkManager DNS server; direct-IP routing remains available"
+    fi
     if ! start_dnsmasq; then
-      rollback_runtime
-      die "isolated DHCP/DNS startup failed and WiPi-owned resources were rolled back"
+      die "could not start the supervised WiPi DHCP/DNS service"
     fi
   fi
-  trap - ERR
+  verify_runtime_for_mode ||
+    die "runtime verification rejected the requested WiPi mode"
+  trap - EXIT ERR
 }
 
 service_stop() {
@@ -896,6 +1500,7 @@ service_stop() {
     nmcli connection down "${CONNECTION_NAME}" >/dev/null 2>&1 || true
   fi
   remove_firewall
+  remove_policy_routing
   restore_ip_forwarding
 }
 
@@ -928,11 +1533,66 @@ restart_access_point() {
   fi
 }
 
+network_changed() {
+  require_root
+  local interface=${1:-}
+  (($# == 2)) || return 0
+  [[ ${interface} =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$ ]] || return 0
+  [[ -r ${CONFIG_FILE} ]] || return 0
+  set_defaults
+  load_config
+  migrate_old_default_address
+  UPSTREAM_WAS_OVERRIDDEN=0
+  validate_logical_settings
+  if [[ ${WIPI_MODE} == "routed" &&
+    -n ${WIPI_UPSTREAM_INTERFACE} &&
+    ${interface} == "${WIPI_UPSTREAM_INTERFACE}" ]]; then
+    systemctl --no-block try-restart "${SERVICE_NAME}"
+  fi
+}
+
 remove_legacy_profile() {
   if connection_exists_named "${LEGACY_CONNECTION_NAME}"; then
     log "removing the obsolete WiPi profile '${LEGACY_CONNECTION_NAME}'"
     nmcli connection delete "${LEGACY_CONNECTION_NAME}" >/dev/null
   fi
+}
+
+INSTALL_TRANSACTION_BACKUP=""
+INSTALL_HAD_PREVIOUS_CONFIG=0
+
+rollback_install_transaction() {
+  local status=$?
+  trap - EXIT ERR
+  set +e
+  warn "installation activation failed; rolling back WiPi-owned runtime state"
+  systemctl stop "${DNS_SERVICE_NAME}" >/dev/null 2>&1
+  systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1
+  rollback_runtime
+  if ((INSTALL_HAD_PREVIOUS_CONFIG == 1)) &&
+    [[ -r ${INSTALL_TRANSACTION_BACKUP} ]]; then
+    install -m 600 "${INSTALL_TRANSACTION_BACKUP}" "${CONFIG_FILE}"
+    set_defaults
+    load_config
+    UPSTREAM_WAS_OVERRIDDEN=0
+    validate_logical_settings
+    configure_country
+    (configure_profile) >/dev/null 2>&1 ||
+      warn "the previous NetworkManager profile could not be fully restored"
+    systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 ||
+      warn "the previous WiPi runtime could not be restarted"
+  else
+    rm -f "${CONFIG_FILE}"
+    if connection_exists; then
+      nmcli connection delete "${CONNECTION_NAME}" >/dev/null 2>&1
+    fi
+    rm -f "${UNIT_FILE}" "${DNS_UNIT_FILE}" "${ROUTING_TABLE_FILE}" \
+      "${DISPATCHER_FILE}" "${INSTALLED_COMMAND}"
+    rm -rf -- "${RUN_DIR}" "${STATE_DIR}"
+    systemctl daemon-reload >/dev/null 2>&1
+  fi
+  rm -f "${INSTALL_TRANSACTION_BACKUP}"
+  return "${status}"
 }
 
 install_wipi() {
@@ -943,15 +1603,30 @@ install_wipi() {
   prepare_configuration yes "$@"
   validate_settings
 
+  install -d -m 700 "${RUN_DIR}"
+  if [[ -r ${CONFIG_FILE} ]]; then
+    INSTALL_HAD_PREVIOUS_CONFIG=1
+    INSTALL_TRANSACTION_BACKUP=$(mktemp \
+      "${RUN_DIR}/wipi.install.rollback.XXXXXX")
+    install -m 600 "${CONFIG_FILE}" "${INSTALL_TRANSACTION_BACKUP}"
+  fi
+  trap rollback_install_transaction EXIT
+
   configure_profile
   write_config
   install_command
   write_systemd_unit
+  write_routing_table_file
+  write_network_dispatcher
   remove_legacy_profile
 
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}" >/dev/null
-  systemctl restart "${SERVICE_NAME}"
+  systemctl restart "${SERVICE_NAME}" ||
+    die "the installed WiPi mode failed runtime verification"
+  trap - EXIT
+  rm -f "${INSTALL_TRANSACTION_BACKUP}"
+  INSTALL_TRANSACTION_BACKUP=""
 
   log "access point installed in ${WIPI_MODE} mode"
   printf 'SSID:       %s\n' "${WIPI_SSID}"
@@ -959,6 +1634,30 @@ install_wipi() {
   printf 'Interface:  %s\n' "${WIPI_INTERFACE}"
   printf 'Address:    %s\n' "${WIPI_ADDRESS}"
   printf 'Status:     sudo wipi status\n'
+}
+
+CONFIG_TRANSACTION_BACKUP=""
+
+rollback_configuration_transaction() {
+  local status=$?
+  trap - EXIT ERR
+  set +e
+  warn "configuration activation failed; restoring the previous WiPi configuration"
+  systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1
+  if [[ -r ${CONFIG_TRANSACTION_BACKUP} ]]; then
+    install -m 600 "${CONFIG_TRANSACTION_BACKUP}" "${CONFIG_FILE}"
+    set_defaults
+    load_config
+    UPSTREAM_WAS_OVERRIDDEN=0
+    validate_logical_settings
+    configure_country
+    (configure_profile) >/dev/null 2>&1 ||
+      warn "the previous NetworkManager profile could not be fully restored"
+    systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 ||
+      warn "the previous WiPi runtime could not be restarted"
+  fi
+  rm -f "${CONFIG_TRANSACTION_BACKUP}"
+  return "${status}"
 }
 
 configure_wipi() {
@@ -970,22 +1669,40 @@ configure_wipi() {
     interactive_configuration
   fi
   validate_settings
+  install -d -m 700 "${RUN_DIR}"
+  CONFIG_TRANSACTION_BACKUP=$(mktemp "${RUN_DIR}/wipi.conf.rollback.XXXXXX")
+  install -m 600 "${CONFIG_FILE}" "${CONFIG_TRANSACTION_BACKUP}"
+  trap rollback_configuration_transaction EXIT
+
+  systemctl stop "${SERVICE_NAME}" ||
+    die "could not stop the previous WiPi mode before reconfiguration"
   configure_profile
   write_config
-  if systemctl is-enabled "${SERVICE_NAME}" >/dev/null 2>&1; then
-    systemctl restart "${SERVICE_NAME}"
-  else
-    start_access_point
-  fi
+  systemctl start "${SERVICE_NAME}" ||
+    die "the requested WiPi configuration could not be activated"
+  trap - EXIT
+  rm -f "${CONFIG_TRANSACTION_BACKUP}"
+  CONFIG_TRANSACTION_BACKUP=""
   log "configuration updated"
 }
 
 set_mode() {
   local mode=${1:-}
-  (($# == 1)) &&
-    [[ ${mode} == "routed" || ${mode} == "isolated" ]] ||
-    die "usage: sudo wipi mode routed|isolated"
-  configure_wipi --mode "${mode}"
+  case ${mode} in
+    isolated)
+      (($# == 1)) ||
+        die "usage: sudo wipi mode isolated"
+      configure_wipi --mode isolated
+      ;;
+    routed)
+      (($# == 3)) && [[ $2 == "--upstream-interface" ]] ||
+        die "usage: sudo wipi mode routed --upstream-interface auto|INTERFACE"
+      configure_wipi --mode routed --upstream-interface "$3"
+      ;;
+    *)
+      die "usage: sudo wipi mode isolated | sudo wipi mode routed --upstream-interface auto|INTERFACE"
+      ;;
+  esac
 }
 
 client_count() {
@@ -1014,8 +1731,55 @@ default_route_summary() {
   fi
 }
 
+load_pinned_runtime_metadata() {
+  UPSTREAM_IPV4=""
+  UPSTREAM_SUBNET=""
+  UPSTREAM_GATEWAY=""
+  UPSTREAM_ROUTE_LINES=""
+  PINNED_DNS_SERVERS=""
+  local cidr
+  cidr=$(ip -o -4 address show dev "${WIPI_UPSTREAM_INTERFACE}" \
+    scope global 2>/dev/null |
+    awk '$3 == "inet" && $4 !~ /^169\\.254\\./ {print $4; exit}')
+  if [[ -n ${cidr} ]]; then
+    UPSTREAM_IPV4=${cidr%/*}
+    UPSTREAM_SUBNET=$(cidr_network "${cidr}" 2>/dev/null || true)
+  fi
+  UPSTREAM_ROUTE_LINES=$(ip -4 route show dev \
+    "${WIPI_UPSTREAM_INTERFACE}" 2>/dev/null || true)
+  UPSTREAM_GATEWAY=$(ip -4 route show default dev \
+    "${WIPI_UPSTREAM_INTERFACE}" 2>/dev/null |
+    awk '
+      NR == 1 {
+        for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}
+      }
+    ')
+  collect_upstream_dns
+}
+
+pinned_upstream_runtime_is_usable() {
+  local link_output flags wireless_info
+  link_output=$(ip -o link show dev "${WIPI_UPSTREAM_INTERFACE}" \
+    2>/dev/null || true)
+  [[ -n ${link_output} ]] || return 1
+  flags=${link_output#*<}
+  flags=${flags%%>*}
+  [[ ,${flags}, == *,UP,* ]] || return 1
+  local carrier_path="${WIPI_SYS_CLASS_NET_ROOT:-/sys/class/net}/${WIPI_UPSTREAM_INTERFACE}/carrier"
+  if [[ -r ${carrier_path} && $(<"${carrier_path}") != "1" ]]; then
+    return 1
+  fi
+  wireless_info=$(iw dev "${WIPI_UPSTREAM_INTERFACE}" info \
+    2>/dev/null || true)
+  grep -Eq '^[[:space:]]*type[[:space:]]+monitor([[:space:]]|$)' \
+    <<<"${wireless_info}" && return 1
+  [[ -n ${UPSTREAM_IPV4} && -n ${UPSTREAM_SUBNET} &&
+    -n ${UPSTREAM_ROUTE_LINES} ]] || return 1
+  ! cidrs_overlap "${AP_SUBNET}" "${UPSTREAM_SUBNET}"
+}
+
 status_value() {
-  printf '%-21s %s\n' "$1:" "$2"
+  printf '%-26s %s\n' "$1:" "$2"
 }
 
 show_status() {
@@ -1024,7 +1788,9 @@ show_status() {
   [[ -r ${CONFIG_FILE} ]] || die "WiPi is not installed"
   set_defaults
   load_config
+  migrate_old_default_address
   validate_logical_settings
+  dhcp_values
 
   local active_state="inactive"
   profile_is_active && active_state="active"
@@ -1032,24 +1798,8 @@ show_status() {
   systemctl is-enabled "${SERVICE_NAME}" >/dev/null 2>&1 &&
     autostart="enabled"
 
-  local dhcp dns forwarding nat upstream
-  if [[ ${WIPI_MODE} == "isolated" ]]; then
-    dns="local-only"
-    forwarding="blocked"
-    nat="disabled"
-    upstream="none"
-    if dnsmasq_is_running; then
-      dhcp="active"
-    else
-      dhcp="inactive"
-    fi
-  else
-    dns="forwarded"
-    forwarding="enabled"
-    nat="enabled (NetworkManager)"
-    dhcp=${active_state}
-    upstream=${WIPI_UPSTREAM_INTERFACE:-automatic}
-  fi
+  local dhcp
+  dnsmasq_is_running && dhcp="active" || dhcp="inactive"
 
   printf 'WiPi status\n'
   status_value "Mode" "${WIPI_MODE}"
@@ -1058,15 +1808,85 @@ show_status() {
   status_value "SSID" "${WIPI_SSID}"
   status_value "Band/channel" "${WIPI_BAND} GHz / ${WIPI_CHANNEL}"
   status_value "AP address" "${WIPI_ADDRESS}"
+  status_value "AP subnet" "${AP_SUBNET}"
+  status_value "DHCP range" "${DHCP_START}-${DHCP_END}"
   status_value "Local hostname" "${WIPI_HOSTNAME}"
   status_value "Connected clients" "$(client_count)"
-  status_value "DHCP" "${dhcp}"
-  status_value "DNS mode" "${dns}"
-  status_value "Forwarding" "${forwarding}"
-  status_value "NAT" "${nat}"
-  status_value "Upstream interface" "${upstream}"
-  if [[ ${WIPI_MODE} == "routed" ]]; then
+
+  if [[ ${WIPI_MODE} == "isolated" ]]; then
+    status_value "Routing behavior" "management only"
+    status_value "DHCP" "${dhcp}"
+    status_value "DNS mode" "local only"
+    if isolated_filter_is_active; then
+      status_value "Forwarding rule" "active"
+    else
+      status_value "Forwarding rule" "missing"
+    fi
+    if wipi_nat_is_absent && ap_nat_is_absent; then
+      status_value "NAT" "disabled"
+    else
+      status_value "NAT" "unexpected"
+    fi
+    status_value "Upstream interface" "none"
+  elif [[ -z ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    status_value "Routing behavior" "automatic"
+    status_value "Upstream selection" "host routing table"
     status_value "Default route" "$(default_route_summary)"
+    status_value "Egress pinning" "disabled"
+    if [[ $(profile_value ipv4.method) == "shared" ]]; then
+      status_value "NetworkManager sharing" "configured/${active_state}"
+    else
+      status_value "NetworkManager sharing" "not configured"
+    fi
+    status_value "NAT ownership" "NetworkManager"
+    status_value "NAT runtime state" "$(automatic_nat_runtime_state)"
+    status_value "DNS mode" "NetworkManager shared"
+  else
+    load_pinned_runtime_metadata
+    local policy_state="missing" table_state="invalid"
+    local filter_state="missing" nat_state="missing"
+    local dns_state="unverified" other_egress="unverified"
+    local egress_state="not enforced" dns_safe=0 upstream_usable=0
+    pinned_upstream_runtime_is_usable && upstream_usable=1
+    policy_rule_is_active && policy_state="active"
+    if [[ ${upstream_usable} == "1" ]] && routing_table_is_valid; then
+      table_state="valid"
+    fi
+    if pinned_filter_is_active; then
+      filter_state="active"
+      other_egress="blocked"
+    fi
+    pinned_nat_is_active && nat_state="${WIPI_UPSTREAM_INTERFACE} only"
+    if dnsmasq_is_running && dnsmasq_configuration_is_safe &&
+      pinned_dns_routes_are_valid; then
+      dns_safe=1
+      if [[ -n ${PINNED_DNS_SERVERS} ]]; then
+        dns_state="${WIPI_UPSTREAM_INTERFACE}"
+      else
+        dns_state="none (unavailable)"
+      fi
+    fi
+    if [[ ${policy_state} == "active" && ${table_state} == "valid" &&
+      ${filter_state} == "active" &&
+      ${nat_state} == "${WIPI_UPSTREAM_INTERFACE} only" &&
+      ${other_egress} == "blocked" && ${dns_safe} == "1" &&
+      ${upstream_usable} == "1" ]]; then
+      egress_state="enforced"
+    fi
+
+    status_value "Routing behavior" "pinned"
+    status_value "DHCP" "${dhcp}"
+    status_value "Upstream interface" "${WIPI_UPSTREAM_INTERFACE}"
+    status_value "Upstream IPv4 address" "${UPSTREAM_IPV4:-unavailable}"
+    status_value "Upstream subnet" "${UPSTREAM_SUBNET:-unavailable}"
+    status_value "Upstream gateway" "${UPSTREAM_GATEWAY:-none}"
+    status_value "Policy rule" "${policy_state}"
+    status_value "Routing table 4242" "${table_state}"
+    status_value "Forwarding filter" "${filter_state}"
+    status_value "NAT rule" "${nat_state}"
+    status_value "DNS upstream" "${dns_state}"
+    status_value "Other AP egress" "${other_egress}"
+    status_value "Egress pinning" "${egress_state}"
   fi
   status_value "Autostart" "${autostart}"
 }
@@ -1088,7 +1908,9 @@ show_diagnostics() {
   [[ -r ${CONFIG_FILE} ]] || die "WiPi is not installed"
   set_defaults
   load_config
+  migrate_old_default_address
   validate_logical_settings
+  dhcp_values
 
   printf '== WiPi configuration ==\n'
   redacted_config
@@ -1129,11 +1951,29 @@ show_diagnostics() {
 
   printf '\n== Routes and forwarding ==\n'
   ip -4 route show 2>&1 || true
+  printf '\nWiPi policy rule:\n'
+  policy_rule_text || true
+  printf '\nWiPi routing table %s:\n' "${ROUTING_TABLE_ID}"
+  ip -4 route show table "${ROUTING_TABLE_ID}" 2>&1 || true
   printf 'net.ipv4.ip_forward = %s\n' "$(read_ip_forwarding 2>/dev/null || printf unknown)"
 
   printf '\n== WiPi firewall ==\n'
   nft list table inet wipi_filter 2>&1 || printf 'No WiPi filter table.\n'
   nft list table ip wipi_nat 2>/dev/null || true
+
+  printf '\n== WiPi DHCP/DNS service ==\n'
+  systemctl --no-pager --full status "${DNS_SERVICE_NAME}" 2>&1 |
+    tail -n 30 || true
+  if [[ ${WIPI_MODE} == "routed" &&
+    -n ${WIPI_UPSTREAM_INTERFACE} ]]; then
+    load_pinned_runtime_metadata
+    printf 'Pinned DNS servers:\n'
+    if [[ -n ${PINNED_DNS_SERVERS} ]]; then
+      printf '%s\n' "${PINNED_DNS_SERVERS}"
+    else
+      printf 'none\n'
+    fi
+  fi
 
   printf '\n== Recent NetworkManager AP logs ==\n'
   journalctl --no-pager -u NetworkManager --since '-30 minutes' 2>/dev/null |
@@ -1162,12 +2002,14 @@ uninstall_wipi() {
   esac
 
   if command_exists systemctl; then
+    systemctl disable --now "${DNS_SERVICE_NAME}" >/dev/null 2>&1 || true
     systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
   else
     service_stop
   fi
   stop_dnsmasq
   remove_firewall
+  remove_policy_routing
   restore_ip_forwarding
 
   if command_exists nmcli; then
@@ -1179,7 +2021,8 @@ uninstall_wipi() {
     fi
   fi
 
-  rm -f "${UNIT_FILE}" "${INSTALLED_COMMAND}"
+  rm -f "${UNIT_FILE}" "${DNS_UNIT_FILE}" "${ROUTING_TABLE_FILE}" \
+    "${DISPATCHER_FILE}" "${INSTALLED_COMMAND}"
   rm -rf -- "${RUN_DIR}" "${STATE_DIR}"
   if ((keep_config == 0)); then
     rm -rf -- "${CONFIG_DIR}"
@@ -1209,6 +2052,7 @@ show_help() {
   cat <<EOF
 WiPi ${WIPI_VERSION}
 Usage: sudo wipi COMMAND [OPTIONS]
+Default network: 10.10.0.1/24 (DHCP 10.10.0.10-10.10.0.100)
 
 Commands:
   install [OPTIONS]            Install, configure, and start WiPi
@@ -1217,7 +2061,9 @@ Commands:
   stop                         Stop the access point
   restart                      Restart the access point
   status                       Show concise AP and mode state
-  mode routed|isolated         Persistently switch operating mode
+  mode isolated               Select management-only mode
+  mode routed --upstream-interface auto|NAME
+                               Select automatic or pinned routed mode
   credentials                  Explicitly display the SSID and password
   diagnose                     Show concise AP troubleshooting information
   uninstall [--keep-config]    Remove only WiPi-owned resources
@@ -1226,8 +2072,8 @@ Commands:
 Examples:
   sudo wipi install --mode isolated
   sudo wipi configure --ssid management-ap --interface wlan0
-  sudo wipi mode routed
-  sudo wipi configure --mode routed --upstream-interface eth0
+  sudo wipi mode routed --upstream-interface auto
+  sudo wipi mode routed --upstream-interface eth0
 EOF
 }
 
@@ -1286,6 +2132,9 @@ main() {
     _service-stop)
       require_no_arguments "${command}" "$@"
       service_stop
+      ;;
+    _network-changed)
+      network_changed "$@"
       ;;
     *)
       show_help >&2
